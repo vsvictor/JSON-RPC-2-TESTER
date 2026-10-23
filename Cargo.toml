@@ -1,0 +1,35 @@
+[package]
+name = "JSON-RPC-2-TESTER"
+version = "0.1.0"
+edition = "2024"
+description = "Native desktop showcase for the JSON-RPC-2 Rust client"
+default-run = "JSON-RPC-2-TESTER"
+
+[lib]
+name = "json_rpc_2_tester"
+
+[[bin]]
+name = "JSON-RPC-2-TESTER"
+path = "src/main.rs"
+
+[features]
+default = []
+native-srt = ["json-rpc-2/srt"]
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+json-rpc-2 = { git = "https://github.com/vsvictor/JSON-RPC-2", rev = "0a5cee9c7cd5e2e1ecb4c123c3f99bceeaf6044f", default-features = false, features = ["tcp", "tls", "udp", "rtp", "rudp", "udplite", "dccp", "sctp", "quic", "http1", "http3", "websocket", "websocket_tls", "mqtt", "coap", "amqp"] }
+rcgen = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# The upstream workspace needs extended CONNECT support not yet in crates.io h3.
+# Workspace patches are not inherited by downstream applications.
+[patch.crates-io]
+h3 = { git = "https://github.com/hyperium/h3", rev = "43745ad87e95b0c035ac9c547aad467303213425" }
+h3-quinn = { git = "https://github.com/hyperium/h3", rev = "43745ad87e95b0c035ac9c547aad467303213425" }
