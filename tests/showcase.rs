@@ -1,9 +1,15 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, AtomicU32, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::Context;
 use json_rpc_2::client::RpcClientError;
 use json_rpc_2_tester::{
-    connection::{ConnectionSettings, RuntimeSettings, TRANSPORTS, connect},
+    connection::{
+        ConnectionSettings, GatewaySettings, RuntimeSettings, TRANSPORTS, connect, connect_gateway,
+    },
     demo, requests,
 };
 use serde::Deserialize;
@@ -44,6 +50,7 @@ async fn real_rpc_roundtrips_on_every_sandbox_transport() -> anyhow::Result<()> 
             message: String,
             source: String,
         }
+
         let greeting: Greeting = client.request("greet", json!({"name": "test"})).await?;
         assert_eq!(greeting.message, "Hello, test!");
         assert_eq!(greeting.source, "Rust desktop demo");
@@ -91,6 +98,97 @@ async fn real_rpc_roundtrips_on_every_sandbox_transport() -> anyhow::Result<()> 
         client.close().await.context("close")?;
         assert!(client.request_value("echo", None).await.is_err());
     }
+    server.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn gateway_connection_falls_back_to_tcp_after_quic_and_tls_fail() -> anyhow::Result<()> {
+    let server = demo::start().await?;
+    let tcp_port = server
+        .running
+        .listeners()
+        .find(|(kind, _)| kind.id() == "tcp")
+        .unwrap()
+        .1
+        .port();
+    let settings = GatewaySettings {
+        host: "127.0.0.1".into(),
+        port: tcp_port,
+        server_name: "localhost".into(),
+        ca_file: String::new(),
+        ca_pem: server.ca_pem.clone(),
+        connect_timeout_ms: 150,
+        retry_delay_ms: 0,
+        control_port: 1,
+        control_timeout_ms: 100,
+        recovery_attempts: Arc::new(AtomicU32::new(3)),
+        transport_policy: Arc::new(AtomicU8::new(0b0000_0111)),
+        gateway_up_return_sec: 30,
+    };
+
+    let policy = Arc::clone(&settings.transport_policy);
+    let (client, transport) = connect_gateway(settings, RuntimeSettings::default()).await?;
+    assert_eq!(transport.kind(), "tcp");
+    policy.store(0, Ordering::Relaxed);
+    assert!(transport.reconnect().await.is_err());
+    assert_eq!(transport.kind(), "tcp");
+    assert_eq!(
+        client
+            .request_value("echo", Some(json!({"active_session_kept": true})))
+            .await?,
+        json!({"active_session_kept": true})
+    );
+    policy.store(0b0000_0111, Ordering::Relaxed);
+    transport.reconnect().await?;
+    assert_eq!(transport.kind(), "tcp");
+    assert_eq!(
+        client
+            .request_value("echo", Some(json!({"fallback": true})))
+            .await?,
+        json!({"fallback": true})
+    );
+
+    client.close().await?;
+    server.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn gateway_connection_falls_back_to_verified_tls_after_quic_fails() -> anyhow::Result<()> {
+    let server = demo::start().await?;
+    let tls_port = server
+        .running
+        .listeners()
+        .find(|(kind, _)| kind.id() == "tls")
+        .unwrap()
+        .1
+        .port();
+    let settings = GatewaySettings {
+        host: "127.0.0.1".into(),
+        port: tls_port,
+        server_name: "localhost".into(),
+        ca_file: String::new(),
+        ca_pem: server.ca_pem.clone(),
+        connect_timeout_ms: 150,
+        retry_delay_ms: 0,
+        control_port: 1,
+        control_timeout_ms: 100,
+        recovery_attempts: Arc::new(AtomicU32::new(3)),
+        transport_policy: Arc::new(AtomicU8::new(0b0000_0111)),
+        gateway_up_return_sec: 30,
+    };
+
+    let (client, transport) = connect_gateway(settings, RuntimeSettings::default()).await?;
+    assert_eq!(transport.kind(), "tls");
+    assert_eq!(
+        client
+            .request_value("echo", Some(json!({"verified_fallback": true})))
+            .await?,
+        json!({"verified_fallback": true})
+    );
+
+    client.close().await?;
     server.close().await?;
     Ok(())
 }

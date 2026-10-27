@@ -2,19 +2,19 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fmt::Write as _,
     future::Future,
+    path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, anyhow};
 use eframe::egui::{self, Color32, RichText, TextEdit};
-use json_rpc_2::TcpCongestionControl;
 use json_rpc_2_tester::{
-    connection::{self, Client, ConnectionSettings, RuntimeSettings, TRANSPORTS, Transport},
-    demo, requests,
+    connection::{self, Client, GatewaySettings, RuntimeSettings, Transport},
+    ecosystem, requests,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -26,14 +26,54 @@ use tracing::{
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 const ACCENT: Color32 = Color32::from_rgb(72, 210, 185);
+const QUIC_COLOR: Color32 = Color32::from_rgb(50, 205, 50);
+const TLS_COLOR: Color32 = Color32::from_rgb(55, 125, 255);
+const TCP_COLOR: Color32 = Color32::from_rgb(95, 205, 245);
 const MAX_LOG_ENTRIES: usize = 500;
 const MAX_TEXT_BYTES: usize = 32 * 1024;
 
+fn transport_color(kind: &str) -> Color32 {
+    match kind {
+        "quic" => QUIC_COLOR,
+        "tls" => TLS_COLOR,
+        "tcp" => TCP_COLOR,
+        _ => Color32::LIGHT_RED,
+    }
+}
+
+fn transport_enabled_mask(transports: &[ecosystem::TransportStatus]) -> [bool; 3] {
+    ["quic", "tls", "tcp"].map(|name| {
+        transports
+            .iter()
+            .find(|transport| transport.transport.eq_ignore_ascii_case(name))
+            .is_some_and(|transport| transport.enabled)
+    })
+}
+
 enum Event {
-    Connected(Result<(Client, Transport)>),
-    Disconnected(Result<()>),
-    DemoStarted(Result<demo::DemoServer>),
-    DemoStopped(Result<()>),
+    Connected {
+        generation: u64,
+        result: Result<(Client, Transport)>,
+    },
+    MethodsLoaded {
+        generation: u64,
+        result: Result<Vec<ecosystem::MethodInfo>>,
+    },
+    TransportsLoaded {
+        generation: u64,
+        result: Result<Vec<ecosystem::TransportStatus>>,
+    },
+    ReturnAttempted {
+        generation: u64,
+        target: String,
+        result: Result<()>,
+    },
+    TransportUpdated {
+        generation: u64,
+        transport: String,
+        enabled: bool,
+        result: Result<()>,
+    },
     Finished {
         id: u64,
         label: String,
@@ -98,6 +138,7 @@ enum Tab {
     Policy,
     Metrics,
     Log,
+    Map,
 }
 
 struct LogEntry {
@@ -106,27 +147,185 @@ struct LogEntry {
     message: String,
 }
 
+#[derive(Clone, Default)]
+struct SettingsDraft {
+    host: String,
+    port: String,
+    server_name: String,
+    ca_file: String,
+    connect_timeout_ms: String,
+    retry_delay_ms: String,
+    control_port: String,
+    control_timeout_ms: String,
+    ping_ms: String,
+    missed_pongs: String,
+    recovery_attempts: String,
+    gateway_up_return_sec: String,
+}
+
+fn parse_setting<T: std::str::FromStr>(value: &str, key: &str) -> Result<T>
+where
+    T::Err: std::fmt::Display,
+{
+    value
+        .trim()
+        .parse()
+        .map_err(|error| anyhow!("Invalid {key}: {error}"))
+}
+
+impl SettingsDraft {
+    fn from_env_file() -> Result<Self> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".env");
+        let mut values = BTreeMap::new();
+        match dotenvy::from_path_iter(path) {
+            Ok(entries) => {
+                for entry in entries {
+                    let (key, value) = entry.context("Parsing .env settings")?;
+                    values.insert(key, value);
+                }
+            }
+            Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Reading .env settings"),
+        }
+        let value = |key: &str, default: &str| {
+            std::env::var(key)
+                .ok()
+                .or_else(|| values.get(key).cloned())
+                .unwrap_or_else(|| default.to_owned())
+        };
+        Ok(Self {
+            host: value("GATEWAY_HOST", ""),
+            port: value("GATEWAY_PORT", ""),
+            server_name: value("GATEWAY_TLS_SERVER_NAME", ""),
+            ca_file: value("GATEWAY_CA_FILE", ""),
+            connect_timeout_ms: value("GATEWAY_CONNECT_TIMEOUT_MS", "10000"),
+            retry_delay_ms: value("GATEWAY_RETRY_DELAY_MS", "500"),
+            control_port: value("GATEWAY_CONTROL_PORT", ""),
+            control_timeout_ms: value("GATEWAY_CONTROL_TIMEOUT_MS", "5000"),
+            ping_ms: value("GATEWAY_PING_INTERVAL_MS", "10000"),
+            missed_pongs: value("GATEWAY_MISSED_PONGS", "3"),
+            recovery_attempts: value("GATEWAY_RECOVERY_ATTEMPTS", "3"),
+            gateway_up_return_sec: value("GATEWAY_UP_RETURN_SEC", "30"),
+        })
+    }
+
+    fn from_settings(settings: &GatewaySettings, policy: &RuntimeSettings) -> Self {
+        Self {
+            host: settings.host.clone(),
+            port: settings.port.to_string(),
+            server_name: settings.server_name.clone(),
+            ca_file: settings.ca_file.clone(),
+            connect_timeout_ms: settings.connect_timeout_ms.to_string(),
+            retry_delay_ms: settings.retry_delay_ms.to_string(),
+            control_port: settings.control_port.to_string(),
+            control_timeout_ms: settings.control_timeout_ms.to_string(),
+            ping_ms: policy.ping_ms.to_string(),
+            missed_pongs: policy.missed_pongs.to_string(),
+            recovery_attempts: policy.recovery_attempts.to_string(),
+            gateway_up_return_sec: settings.gateway_up_return_sec.to_string(),
+        }
+    }
+
+    fn build(&self) -> Result<(GatewaySettings, RuntimeSettings)> {
+        for (key, value) in [
+            ("GATEWAY_HOST", self.host.as_str()),
+            ("GATEWAY_TLS_SERVER_NAME", self.server_name.as_str()),
+            ("GATEWAY_CA_FILE", self.ca_file.as_str()),
+        ] {
+            anyhow::ensure!(
+                !value.contains(['\n', '\r']),
+                "{key} must not contain a line break"
+            );
+        }
+        let ca_file = self.ca_file.trim().to_owned();
+        let ca_pem = std::fs::read_to_string(&ca_file)
+            .with_context(|| format!("Reading trusted gateway CA file {ca_file}"))?;
+        let policy = RuntimeSettings {
+            ping_ms: parse_setting(&self.ping_ms, "GATEWAY_PING_INTERVAL_MS")?,
+            missed_pongs: parse_setting(&self.missed_pongs, "GATEWAY_MISSED_PONGS")?,
+            recovery_attempts: parse_setting(&self.recovery_attempts, "GATEWAY_RECOVERY_ATTEMPTS")?,
+            ..RuntimeSettings::default()
+        };
+        policy.config()?;
+        let settings = GatewaySettings {
+            host: self.host.trim().to_owned(),
+            port: parse_setting(&self.port, "GATEWAY_PORT")?,
+            server_name: self.server_name.trim().to_owned(),
+            ca_file,
+            ca_pem,
+            connect_timeout_ms: parse_setting(
+                &self.connect_timeout_ms,
+                "GATEWAY_CONNECT_TIMEOUT_MS",
+            )?,
+            retry_delay_ms: parse_setting(&self.retry_delay_ms, "GATEWAY_RETRY_DELAY_MS")?,
+            control_port: parse_setting(&self.control_port, "GATEWAY_CONTROL_PORT")?,
+            control_timeout_ms: parse_setting(
+                &self.control_timeout_ms,
+                "GATEWAY_CONTROL_TIMEOUT_MS",
+            )?,
+            recovery_attempts: Arc::new(AtomicU32::new(policy.recovery_attempts)),
+            transport_policy: Arc::new(std::sync::atomic::AtomicU8::new(0b0000_0111)),
+            gateway_up_return_sec: parse_setting(
+                &self.gateway_up_return_sec,
+                "GATEWAY_UP_RETURN_SEC",
+            )?,
+        };
+        settings.validate()?;
+        Ok((settings, policy))
+    }
+
+    fn to_env(&self) -> String {
+        format!(
+            "GATEWAY_HOST={}\nGATEWAY_PORT={}\nGATEWAY_TLS_SERVER_NAME={}\nGATEWAY_CA_FILE={}\nGATEWAY_CONNECT_TIMEOUT_MS={}\nGATEWAY_RETRY_DELAY_MS={}\nGATEWAY_CONTROL_PORT={}\nGATEWAY_CONTROL_TIMEOUT_MS={}\nGATEWAY_PING_INTERVAL_MS={}\nGATEWAY_MISSED_PONGS={}\nGATEWAY_RECOVERY_ATTEMPTS={}\nGATEWAY_UP_RETURN_SEC={}\n",
+            self.host.trim(),
+            self.port.trim(),
+            self.server_name.trim(),
+            self.ca_file.trim(),
+            self.connect_timeout_ms.trim(),
+            self.retry_delay_ms.trim(),
+            self.control_port.trim(),
+            self.control_timeout_ms.trim(),
+            self.ping_ms.trim(),
+            self.missed_pongs.trim(),
+            self.recovery_attempts.trim(),
+            self.gateway_up_return_sec.trim()
+        )
+    }
+}
+
 pub struct DesktopApp {
+    map: crate::ecosystem_map::EcosystemMap,
     runtime: Option<Runtime>,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
     trace_rx: mpsc::Receiver<TraceLine>,
     debug: Arc<AtomicBool>,
     dropped: Arc<AtomicUsize>,
-    connection: ConnectionSettings,
+    connection: Option<GatewaySettings>,
     policy: RuntimeSettings,
     client: Option<(Client, Transport)>,
-    session: String,
+    connection_error: bool,
     control: Option<JoinHandle<()>>,
-    server: Option<demo::DemoServer>,
-    server_control: Option<JoinHandle<()>>,
-    listeners: Vec<(String, u16)>,
+    method_discovery: Option<JoinHandle<()>>,
+    transports: Vec<ecosystem::TransportStatus>,
+    transports_initialized: bool,
+    transports_loading: bool,
+    transport_operation: Option<String>,
+    return_in_progress: bool,
+    last_transport_poll: Instant,
+    connection_generation: u64,
+    settings_open: bool,
+    settings_draft: Option<SettingsDraft>,
+    settings_error: Option<String>,
     tasks: BTreeMap<u64, (String, JoinHandle<()>)>,
     next_id: u64,
     started: Instant,
     logs: VecDeque<LogEntry>,
     tab: Tab,
     method: String,
+    methods: Vec<ecosystem::MethodInfo>,
+    methods_loading: bool,
+    methods_error: Option<String>,
     params: String,
     parallel_count: usize,
     batch: String,
@@ -159,36 +358,85 @@ impl DesktopApp {
             })
             .try_init()
             .context("Installing tracing subscriber")?;
-        Ok(Self {
+        let (connection, policy, configuration_error) = match GatewaySettings::from_env() {
+            Ok(settings) => match RuntimeSettings::from_env() {
+                Ok(policy) => {
+                    settings.set_recovery_attempts(policy.recovery_attempts);
+                    (Some(settings), policy, None)
+                }
+                Err(error) => (None, RuntimeSettings::default(), Some(format!("{error:#}"))),
+            },
+            Err(error) => (None, RuntimeSettings::default(), Some(format!("{error:#}"))),
+        };
+        let map = connection.as_ref().map_or_else(
+            crate::ecosystem_map::EcosystemMap::default,
+            |connection| {
+                crate::ecosystem_map::EcosystemMap::configured_with_transport(
+                    connection.host.clone(),
+                    connection.control_port,
+                    connection.control_timeout_ms,
+                    ecosystem::CONTROL_PLANE_TRANSPORT,
+                    connection.server_name.clone(),
+                    connection.ca_pem.clone(),
+                )
+            },
+        );
+        let mut app = Self {
+            map,
             runtime: Some(runtime),
             tx,
             rx,
             trace_rx,
             debug,
             dropped,
-            connection: Default::default(),
-            policy: Default::default(),
+            connection,
+            policy,
             client: None,
-            session: String::new(),
+            connection_error: configuration_error.is_some(),
             control: None,
-            server: None,
-            server_control: None,
-            listeners: Vec::new(),
+            method_discovery: None,
+            transports: Vec::new(),
+            transports_initialized: false,
+            transports_loading: false,
+            transport_operation: None,
+            return_in_progress: false,
+            last_transport_poll: Instant::now(),
+            connection_generation: 0,
+            settings_open: false,
+            settings_draft: None,
+            settings_error: None,
             tasks: BTreeMap::new(),
             next_id: 1,
             started: Instant::now(),
             logs: VecDeque::new(),
             tab: Tab::Request,
-            method: "echo".into(),
+            method: String::new(),
+            methods: Vec::new(),
+            methods_loading: false,
+            methods_error: None,
             params: "{\n  \"message\": \"Hello, desktop!\"\n}".into(),
             parallel_count: 8,
             batch: requests::DEFAULT_BATCH.into(),
-            response: "Start the local demo server, select its endpoint, then connect.".into(),
-            response_error: false,
-            status: "Ready".into(),
+            response: configuration_error
+                .as_ref()
+                .map_or_else(|| "Connecting to gateway from .env…".into(), |error| {
+                    format!(
+                        "Gateway configuration is unavailable: {error}\n\nCheck .env values for the gateway, CA file, GATEWAY_PING_INTERVAL_MS, GATEWAY_MISSED_PONGS, and GATEWAY_RECOVERY_ATTEMPTS, then restart the app."
+                    )
+                }),
+            response_error: configuration_error.is_some(),
+            status: if configuration_error.is_some() {
+                "Gateway configuration required".into()
+            } else {
+                "Ready".into()
+            },
             log_filter: String::new(),
             only_errors: false,
-        })
+        };
+        if configuration_error.is_none() {
+            app.start_connection();
+        }
+        Ok(app)
     }
 
     fn rt(&self) -> &Runtime {
@@ -218,59 +466,208 @@ impl DesktopApp {
     fn drain(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                Event::Connected(result) => {
+                Event::MethodsLoaded { generation, result } => {
+                    if generation != self.connection_generation {
+                        continue;
+                    }
+                    self.method_discovery = None;
+                    self.methods_loading = false;
+                    match result {
+                        Ok(methods) => {
+                            let selected = methods
+                                .iter()
+                                .any(|method| method.name == self.method)
+                                .then(|| self.method.clone())
+                                .or_else(|| methods.first().map(|method| method.name.clone()))
+                                .unwrap_or_default();
+                            if selected != self.method
+                                && let Some(method) =
+                                    methods.iter().find(|method| method.name == selected)
+                            {
+                                self.params = method.example_params.clone();
+                            }
+                            self.method = selected;
+                            self.methods = methods;
+                            self.methods_error = None;
+                            self.log(
+                                Level::INFO,
+                                format!("Loaded {} implemented RPC methods", self.methods.len()),
+                            );
+                        }
+                        Err(error) => {
+                            let message = format!("{error:#}");
+                            self.methods_error = Some(message.clone());
+                            self.log(
+                                Level::ERROR,
+                                format!("Loading RPC methods failed: {message}"),
+                            );
+                        }
+                    }
+                }
+                Event::TransportsLoaded { generation, result } => {
+                    if generation != self.connection_generation {
+                        continue;
+                    }
+                    self.transports_loading = false;
+                    self.last_transport_poll = Instant::now();
+                    match result {
+                        Ok(transports) => {
+                            let enabled = transport_enabled_mask(&transports);
+                            let was_initialized = self.transports_initialized;
+                            let state_changed = !was_initialized
+                                || transports.len() != self.transports.len()
+                                || transports.iter().any(|current| {
+                                    !self.transports.iter().any(|previous| {
+                                        previous.transport.eq_ignore_ascii_case(&current.transport)
+                                            && previous.enabled == current.enabled
+                                    })
+                                });
+                            let active_kind =
+                                self.client.as_ref().map(|(_, transport)| transport.kind());
+                            let active_was_disabled = active_kind.is_some_and(|kind| {
+                                transports.iter().any(|profile| {
+                                    profile.transport.eq_ignore_ascii_case(kind) && !profile.enabled
+                                })
+                            });
+                            let connecting_with_disabled_profile =
+                                !was_initialized && self.control.is_some() && enabled != [true; 3];
+                            let retry_after_initial_disabled_profiles = !was_initialized
+                                && self.client.is_none()
+                                && self.control.is_none()
+                                && enabled != [true; 3];
+                            if let Some(settings) = &self.connection {
+                                settings.set_transport_policy(enabled, false);
+                            }
+                            self.transports_initialized = true;
+                            self.transports = transports;
+                            if state_changed {
+                                self.log(Level::INFO, "Gateway transport profile state updated");
+                            }
+                            if connecting_with_disabled_profile
+                                || retry_after_initial_disabled_profiles
+                            {
+                                self.log(
+                                    Level::WARN,
+                                    "Transport availability changed; reconnecting QUIC → TLS → TCP",
+                                );
+                                self.start_connection_order(false);
+                            } else if active_was_disabled && !self.return_in_progress {
+                                self.log(
+                                    Level::WARN,
+                                    "Active transport was disabled; reconnecting with available profiles",
+                                );
+                                self.start_return_attempt(enabled, "fallback");
+                            } else if was_initialized && !self.return_in_progress {
+                                match active_kind {
+                                    Some("tcp") if enabled[0] || enabled[1] => {
+                                        let candidates = [enabled[0], enabled[1], false];
+                                        let target = if enabled[0] { "quic" } else { "tls" };
+                                        self.start_return_attempt(candidates, target);
+                                    }
+                                    Some("tls") if enabled[0] => {
+                                        self.start_return_attempt([true, false, false], "quic");
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.log(
+                                Level::ERROR,
+                                format!("Loading gateway transport profiles failed: {error:#}"),
+                            );
+                        }
+                    }
+                }
+                Event::ReturnAttempted {
+                    generation,
+                    target,
+                    result,
+                } => {
+                    if generation != self.connection_generation {
+                        continue;
+                    }
+                    self.return_in_progress = false;
+                    self.last_transport_poll = Instant::now();
+                    if let Some(settings) = &self.connection {
+                        settings
+                            .set_transport_policy(transport_enabled_mask(&self.transports), false);
+                    }
+                    match result {
+                        Ok(()) => {
+                            self.log(Level::INFO, "Gateway transport preference updated");
+                            self.start_transport_discovery();
+                        }
+                        Err(error) => {
+                            self.log(
+                                Level::WARN,
+                                format!(
+                                    "Transport return attempt ({target}) failed; keeping the active session: {error:#}"
+                                ),
+                            );
+                        }
+                    }
+                }
+                Event::TransportUpdated {
+                    generation,
+                    transport,
+                    enabled,
+                    result,
+                } => {
+                    if generation != self.connection_generation {
+                        continue;
+                    }
+                    self.transport_operation = None;
+                    match result {
+                        Ok(()) => {
+                            self.log(
+                                Level::INFO,
+                                format!(
+                                    "Gateway transport {transport} {}",
+                                    if enabled { "enabled" } else { "disabled" }
+                                ),
+                            );
+                            if !enabled {
+                                self.start_transport_discovery();
+                            }
+                        }
+                        Err(error) => {
+                            self.log(
+                                Level::ERROR,
+                                format!("Updating {transport} transport failed: {error:#}"),
+                            );
+                            self.start_transport_discovery();
+                        }
+                    }
+                }
+                Event::Connected { generation, result } => {
+                    if generation != self.connection_generation {
+                        if let Ok((client, _)) = result {
+                            self.rt().spawn(async move {
+                                let _ = client.close().await;
+                            });
+                        }
+                        continue;
+                    }
                     self.control = None;
                     match result {
                         Ok(pair) => {
-                            self.session = format!(
+                            self.connection_error = false;
+                            let session = format!(
                                 "{} / {}",
-                                self.connection.choice.id,
+                                pair.1.kind(),
                                 pair.1.peer().unwrap_or_else(|| "peer not reported".into())
                             );
                             self.client = Some(pair);
                             self.status = "Session open".into();
-                            self.log(Level::INFO, format!("Session opened: {}", self.session));
+                            self.log(Level::INFO, format!("Session opened: {session}"));
+                            self.start_method_discovery();
+                            self.start_transport_discovery();
                         }
-                        Err(error) => self.error(format!("{error:#}")),
-                    }
-                }
-                Event::Disconnected(result) => {
-                    self.control = None;
-                    self.session.clear();
-                    match result {
-                        Ok(()) => {
-                            self.status = "Disconnected".into();
-                            self.log(Level::INFO, "Session closed");
+                        Err(error) => {
+                            self.connection_error = true;
+                            self.error(format!("{error:#}"));
                         }
-                        Err(error) => self.error(error),
-                    }
-                }
-                Event::DemoStarted(result) => {
-                    self.server_control = None;
-                    match result {
-                        Ok(server) => {
-                            self.listeners = server
-                                .running
-                                .listeners()
-                                .map(|(kind, addr)| (kind.id().to_owned(), addr.port()))
-                                .collect();
-                            self.server = Some(server);
-                            self.status =
-                                "Local demo server running; choose an endpoint below".into();
-                            self.log(Level::INFO, format!("Demo listeners: {:?}", self.listeners));
-                            if self.client.is_none() && self.control.is_none() {
-                                self.use_demo("tcp");
-                            }
-                        }
-                        Err(error) => self.error(error),
-                    }
-                }
-                Event::DemoStopped(result) => {
-                    self.server_control = None;
-                    self.listeners.clear();
-                    match result {
-                        Ok(()) => self.log(Level::INFO, "Local demo server stopped"),
-                        Err(error) => self.error(error),
                     }
                 }
                 Event::Finished {
@@ -316,44 +713,255 @@ impl DesktopApp {
         }
     }
 
-    fn use_demo(&mut self, id: &str) {
-        if let Some((_, port)) = self.listeners.iter().find(|(name, _)| name == id)
-            && let Some(choice) = TRANSPORTS.iter().find(|choice| choice.id == id)
-        {
-            self.connection.choice = *choice;
-            self.connection.host = "127.0.0.1".into();
-            self.connection.port = *port;
-            if choice.tls()
-                && let Some(server) = &self.server
-            {
-                self.connection.ca_file.clear();
-                self.connection.ca_pem = server.ca_pem.clone();
-                self.connection.server_name = "localhost".into();
-            }
-        }
+    fn start_connection(&mut self) {
+        self.start_connection_order(false);
     }
 
-    fn start_connection(&mut self) {
-        if let Err(error) = self
-            .connection
-            .validate()
-            .and_then(|_| self.policy.config().map(|_| ()))
-        {
+    fn start_connection_order(&mut self, prefer_reverse: bool) {
+        if let Err(error) = self.policy.config() {
             self.error(error);
             return;
         }
-        let settings = self.connection.clone();
+        let Some(settings) = self.connection.clone() else {
+            return;
+        };
+        if !self.transports_initialized {
+            settings.set_transport_policy([true; 3], prefer_reverse);
+        }
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        let generation = self.connection_generation;
+        if let Some(task) = self.control.take() {
+            task.abort();
+        }
+        if let Some(task) = self.method_discovery.take() {
+            task.abort();
+        }
+        self.methods.clear();
+        self.method.clear();
+        self.methods_error = None;
+        self.methods_loading = false;
+        self.transports_loading = false;
+        self.transport_operation = None;
+        self.return_in_progress = false;
+        self.cancel_all();
+        self.connection_error = false;
+        let previous_client = self.client.take().map(|(client, _)| client);
         let policy = self.policy.clone();
         let tx = self.tx.clone();
         self.status = "Connecting...".into();
         self.control = Some(self.rt().spawn(async move {
-            let result = connection::connect(settings, policy).await;
-            if let Err(error) = tx.send(Event::Connected(result)).await
-                && let Event::Connected(Ok((client, _))) = error.0
+            if let Some(client) = previous_client {
+                let _ = tokio::time::timeout(Duration::from_secs(3), client.close()).await;
+            }
+            let result = connection::connect_gateway(settings, policy).await;
+            if let Err(error) = tx.send(Event::Connected { generation, result }).await
+                && let Event::Connected {
+                    result: Ok((client, _)),
+                    ..
+                } = error.0
             {
                 let _ = client.close().await;
             }
         }));
+    }
+
+    fn start_method_discovery(&mut self) {
+        if self.methods_loading {
+            return;
+        }
+        let Some(connection) = &self.connection else {
+            self.methods_error = Some("Gateway configuration is unavailable".into());
+            return;
+        };
+        let host = connection.host.clone();
+        let port = connection.control_port;
+        let timeout = Duration::from_millis(connection.control_timeout_ms);
+        let transport = ecosystem::CONTROL_PLANE_TRANSPORT.to_owned();
+        let server_name = connection.server_name.clone();
+        let ca_pem = connection.ca_pem.clone();
+        let tx = self.tx.clone();
+        let generation = self.connection_generation;
+        self.methods_loading = true;
+        self.methods_error = None;
+        self.method_discovery = Some(self.rt().spawn(async move {
+            let result = ecosystem::fetch_methods_with_transport(
+                &host,
+                port,
+                timeout,
+                &transport,
+                &server_name,
+                &ca_pem,
+            )
+            .await;
+            let _ = tx.send(Event::MethodsLoaded { generation, result }).await;
+        }));
+    }
+
+    fn start_transport_discovery(&mut self) {
+        if self.transports_loading {
+            return;
+        }
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        let host = connection.host.clone();
+        let port = connection.control_port;
+        let timeout = Duration::from_millis(connection.control_timeout_ms);
+        let transport = ecosystem::CONTROL_PLANE_TRANSPORT.to_owned();
+        let server_name = connection.server_name.clone();
+        let ca_pem = connection.ca_pem.clone();
+        let tx = self.tx.clone();
+        let generation = self.connection_generation;
+        self.last_transport_poll = Instant::now();
+        self.transports_loading = true;
+        self.rt().spawn(async move {
+            let result = ecosystem::fetch_transports_with_transport(
+                &host,
+                port,
+                timeout,
+                &transport,
+                &server_name,
+                &ca_pem,
+            )
+            .await;
+            let _ = tx
+                .send(Event::TransportsLoaded { generation, result })
+                .await;
+        });
+    }
+
+    fn start_return_attempt(&mut self, candidates: [bool; 3], target: &str) {
+        if self.return_in_progress {
+            return;
+        }
+        let Some(settings) = &self.connection else {
+            return;
+        };
+        let Some((_, transport)) = &self.client else {
+            return;
+        };
+        settings.set_transport_policy(candidates, false);
+        let transport = transport.clone();
+        let generation = self.connection_generation;
+        let target = target.to_owned();
+        let tx = self.tx.clone();
+        self.return_in_progress = true;
+        self.log(
+            Level::INFO,
+            format!("Trying preferred transport {target} while keeping the active session"),
+        );
+        self.rt().spawn(async move {
+            let result = transport
+                .reconnect()
+                .await
+                .map_err(|error| anyhow!("{error}"));
+            let _ = tx
+                .send(Event::ReturnAttempted {
+                    generation,
+                    target,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    fn set_transport_enabled(&mut self, transport: String, enabled: bool) {
+        if self.transport_operation.is_some() || self.return_in_progress {
+            return;
+        }
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        let host = connection.host.clone();
+        let port = connection.control_port;
+        let timeout = Duration::from_millis(connection.control_timeout_ms);
+        let connection_transport = ecosystem::CONTROL_PLANE_TRANSPORT.to_owned();
+        let server_name = connection.server_name.clone();
+        let ca_pem = connection.ca_pem.clone();
+        let tx = self.tx.clone();
+        let generation = self.connection_generation;
+        self.transport_operation = Some(transport.clone());
+        self.rt().spawn(async move {
+            let result = ecosystem::set_transport_enabled_with_transport(
+                &host,
+                port,
+                timeout,
+                ecosystem::ControlTransportOptions {
+                    kind: &connection_transport,
+                    server_name: &server_name,
+                    ca_pem: &ca_pem,
+                },
+                &transport,
+                enabled,
+            )
+            .await;
+            let _ = tx
+                .send(Event::TransportUpdated {
+                    generation,
+                    transport,
+                    enabled,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    fn open_settings(&mut self) {
+        self.settings_draft = Some(match &self.connection {
+            Some(settings) => SettingsDraft::from_settings(settings, &self.policy),
+            None => match SettingsDraft::from_env_file() {
+                Ok(draft) => draft,
+                Err(error) => {
+                    self.settings_error = Some(format!("{error:#}"));
+                    SettingsDraft::default()
+                }
+            },
+        });
+        if self.connection.is_some() {
+            self.settings_error = None;
+        }
+        self.settings_open = true;
+    }
+
+    fn save_settings(&mut self) {
+        let Some(draft) = self.settings_draft.clone() else {
+            return;
+        };
+        let result: Result<()> = (|| {
+            let (settings, policy) = draft.build()?;
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".env");
+            let temporary_path = path.with_extension("env.tmp");
+            std::fs::write(&temporary_path, draft.to_env())
+                .context("Writing temporary application settings")?;
+            if let Err(error) = std::fs::rename(&temporary_path, &path) {
+                let _ = std::fs::remove_file(&temporary_path);
+                return Err(error).context("Saving application settings to .env");
+            }
+            settings.set_recovery_attempts(policy.recovery_attempts);
+            self.connection = Some(settings.clone());
+            self.policy = policy;
+            self.map = crate::ecosystem_map::EcosystemMap::configured_with_transport(
+                settings.host.clone(),
+                settings.control_port,
+                settings.control_timeout_ms,
+                ecosystem::CONTROL_PLANE_TRANSPORT,
+                settings.server_name.clone(),
+                settings.ca_pem.clone(),
+            );
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.settings_error = None;
+                self.settings_open = false;
+                self.transports.clear();
+                self.transports_initialized = false;
+                self.transports_loading = false;
+                self.start_connection();
+                self.status = "Settings saved; reconnecting to gateway".into();
+            }
+            Err(error) => self.settings_error = Some(format!("{error:#}")),
+        }
     }
 
     fn cancel_all(&mut self) {
@@ -366,21 +974,6 @@ impl DesktopApp {
                     "#{id} {label}: local task cancelled (server side effects are not rolled back)"
                 ),
             );
-        }
-    }
-
-    fn disconnect(&mut self) {
-        self.cancel_all();
-        if let Some((client, _)) = self.client.take() {
-            let tx = self.tx.clone();
-            self.status = "Closing session...".into();
-            self.control = Some(self.rt().spawn(async move {
-                let result = tokio::time::timeout(Duration::from_secs(5), client.close())
-                    .await
-                    .context("Closing session timed out")
-                    .and_then(|r| r.map_err(Into::into));
-                let _ = tx.send(Event::Disconnected(result)).await;
-            }));
         }
     }
 
@@ -411,6 +1004,10 @@ impl DesktopApp {
     }
 
     fn send_request(&mut self, notification: bool, parallel: bool) {
+        if !self.methods.iter().any(|method| method.name == self.method) {
+            self.error("Select a method reported by the Control Plane before sending a request");
+            return;
+        }
         let input = requests::method(&self.method)
             .and_then(|name| Ok((name, requests::params(&self.params)?)));
         let (name, params) = match input {
@@ -450,164 +1047,168 @@ impl DesktopApp {
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("CONNECTION").color(ACCENT));
-        ui.label("Direct Rust client / no FFI");
+        ui.label("Gateway RPC session shared by every tab");
         ui.separator();
-        ui.add_enabled_ui(self.client.is_none() && self.control.is_none(), |ui| {
-            let previous = self.connection.choice;
-            egui::ComboBox::from_label("Transport")
-                .selected_text(self.connection.choice.id)
-                .show_ui(ui, |ui| {
-                    for choice in TRANSPORTS {
-                        let label = if choice.unavailable().is_some() { format!("{} (unavailable)", choice.id) } else { choice.id.into() };
-                        ui.selectable_value(&mut self.connection.choice, *choice, label);
-                    }
-                });
-            if previous != self.connection.choice {
-                self.connection.port = self.connection.choice.port;
-                if self.connection.choice.broker() {
-                    let mqtt = self.connection.choice.id.ends_with("mqtt");
-                    self.connection.broker_url = if mqtt { "mqtt://127.0.0.1:1883" } else { "amqp://127.0.0.1:5672/%2f" }.into();
-                    self.connection.broker_route = if mqtt { "json-rpc-2/requests" } else { "json-rpc-2.requests" }.into();
-                }
-                let id = self.connection.choice.id;
-                self.use_demo(id);
-            }
-            if let Some(reason) = self.connection.choice.unavailable() {
-                ui.colored_label(Color32::YELLOW, reason);
-            }
-            if self.connection.choice.broker() {
-                field(ui, "Broker URL (may include credentials)", &mut self.connection.broker_url);
-                field(ui, "Request topic / queue", &mut self.connection.broker_route);
-                number(ui, "Broker operation timeout (ms)", &mut self.connection.broker_operation_ms);
-                number(ui, "Broker response timeout (ms)", &mut self.connection.broker_response_ms);
-                ui.small("MQTT/AMQP require an external broker AND an RPC consumer (gateway-iot). WS variants use a private envelope.");
-            } else {
-                field(ui, "Host / IP", &mut self.connection.host);
-                number(ui, "Port", &mut self.connection.port);
-            }
-            number(ui, "Connect timeout (ms)", &mut self.connection.connect_timeout_ms);
-            if matches!(self.connection.choice.id, "ws-http1" | "ws-http3" | "ws-tls") {
-                field(ui, "WebSocket path", &mut self.connection.ws_path);
-            }
-            if self.connection.choice.tls() || self.connection.choice.id.ends_with("mqtt") {
-                ui.collapsing("Certificate trust", |ui| {
-                    if self.connection.choice.tls() {
-                        field(ui, "TLS server name (verified)", &mut self.connection.server_name);
-                    }
-                    field(ui, "CA PEM file (takes priority over text)", &mut self.connection.ca_file);
-                    ui.label("Or paste public CA PEM");
-                    ui.add(TextEdit::multiline(&mut self.connection.ca_pem).desired_rows(5).desired_width(f32::INFINITY));
-                    ui.small("No insecure TLS bypass. AMQP uses system roots; custom CA applies to MQTT and direct TLS transports.");
-                });
-            }
-            if matches!(self.connection.choice.id, "srt" | "ws-srt") {
-                ui.label("SRT passphrase (10..=79 bytes)");
-                ui.add(TextEdit::singleline(&mut self.connection.srt_passphrase).password(true));
-            }
-            if matches!(self.connection.choice.id, "udplite" | "ws-udplite") {
-                number(ui, "Send checksum coverage", &mut self.connection.send_coverage);
-                number(ui, "Receive checksum coverage", &mut self.connection.receive_coverage);
-                ui.small("0 = full checksum, otherwise >= 8");
-            }
-            if matches!(self.connection.choice.id, "tcp" | "tls" | "http1" | "ws-tcp" | "ws-http1" | "ws-tls") {
-                ui.collapsing("TCP socket tuning", |ui| {
-                    ui.checkbox(&mut self.connection.tcp.no_delay, "TCP_NODELAY");
-                    ui.checkbox(&mut self.connection.tcp.fast_open, "TCP Fast Open");
-                    let mut bbr = self.connection.tcp.congestion_control == TcpCongestionControl::Bbr;
-                    ui.checkbox(&mut bbr, "BBR congestion control (requires OS support)");
-                    self.connection.tcp.congestion_control = if bbr { TcpCongestionControl::Bbr } else { TcpCongestionControl::SystemDefault };
-                });
-            }
-        });
-        ui.add_space(8.0);
-        if self.control.is_some() {
-            ui.spinner();
-        } else if self.client.is_some() {
-            if ui.button("Disconnect").clicked() {
-                self.disconnect();
-            }
-        } else if ui
+        if ui
             .add_enabled(
-                self.connection.choice.unavailable().is_none(),
-                egui::Button::new("Connect").fill(ACCENT.gamma_multiply(0.3)),
+                self.connection.is_some() && !self.return_in_progress,
+                egui::Button::new("Reconnect"),
             )
             .clicked()
         {
             self.start_connection();
         }
+        ui.horizontal(|ui| {
+            if let Some((_, transport)) = &self.client {
+                let kind = transport.kind();
+                ui.colored_label(transport_color(kind), "●");
+                ui.colored_label(
+                    transport_color(kind),
+                    format!("Connected via {}", kind.to_uppercase()),
+                );
+            } else if self.control.is_some() {
+                ui.colored_label(Color32::YELLOW, "●");
+                ui.spinner();
+                ui.label("Connecting…");
+            } else {
+                ui.colored_label(Color32::LIGHT_RED, "●");
+                ui.colored_label(
+                    Color32::LIGHT_RED,
+                    if self.connection_error {
+                        "Connection error"
+                    } else {
+                        "Not connected"
+                    },
+                );
+            }
+        });
         ui.separator();
-        ui.heading("LOCAL SANDBOX");
-        if self.server_control.is_some() {
-            ui.spinner();
-        } else if self.server.is_none() {
-            if ui.button("Start demo server").clicked() {
-                let tx = self.tx.clone();
-                self.server_control = Some(self.rt().spawn(async move {
-                    let result = demo::start().await;
-                    if let Err(error) = tx.send(Event::DemoStarted(result)).await
-                        && let Event::DemoStarted(Ok(server)) = error.0
-                    {
-                        let _ = server.close().await;
-                    }
-                }));
-            }
-        } else {
-            ui.label("Running on 127.0.0.1 / dynamic ports");
-            let mut selected = None;
-            ui.add_enabled_ui(self.client.is_none() && self.control.is_none(), |ui| {
-                egui::ComboBox::from_label("Use demo endpoint")
-                    .selected_text("Select transport")
-                    .show_ui(ui, |ui| {
-                        for (id, port) in &self.listeners {
-                            if ui
-                                .selectable_label(false, format!("{id} : {port}"))
-                                .clicked()
-                            {
-                                selected = Some(id.clone());
-                            }
-                        }
-                    });
-            });
-            if let Some(id) = selected {
-                self.use_demo(&id);
-            }
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new("GATEWAY TRANSPORTS").color(ACCENT));
             if ui
                 .add_enabled(
-                    self.client.is_none() && self.control.is_none(),
-                    egui::Button::new("Stop demo server"),
+                    !self.transports_loading
+                        && self.transport_operation.is_none()
+                        && !self.return_in_progress,
+                    egui::Button::new("Refresh"),
                 )
                 .clicked()
-                && let Some(server) = self.server.take()
             {
-                let tx = self.tx.clone();
-                self.server_control = Some(self.rt().spawn(async move {
-                    let result = server.close().await;
-                    let _ = tx.send(Event::DemoStopped(result)).await;
-                }));
+                self.start_transport_discovery();
             }
+            if self.transports_loading {
+                ui.spinner();
+            }
+        });
+        let return_interval = self
+            .connection
+            .as_ref()
+            .map_or(30, |settings| settings.gateway_up_return_sec);
+        ui.small(format!(
+            "Transport status is monitored every {return_interval} seconds."
+        ));
+        ui.small("Disabling closes active sessions; re-enabling does not restore them.");
+        if self.transports.is_empty() && !self.transports_loading {
+            ui.label("Transport state is unavailable.");
         }
-        ui.small("16 local transports, including verified TLS and QUIC with an ephemeral localhost certificate. Brokers and kernel-specific transports use an external server.");
+        let mut transport_statuses = self.transports.clone();
+        transport_statuses.sort_by_key(|status| match status.transport.as_str() {
+            "quic" => 0,
+            "tls" => 1,
+            "tcp" => 2,
+            _ => 3,
+        });
+        let mut transport_change = None;
+        ui.add_enabled_ui(
+            !self.transports_loading
+                && self.transport_operation.is_none()
+                && !self.return_in_progress,
+            |ui| {
+                for status in transport_statuses {
+                    let mut enabled = status.enabled;
+                    if ui
+                        .checkbox(&mut enabled, status.transport.to_uppercase())
+                        .changed()
+                    {
+                        transport_change = Some((status.transport, enabled));
+                    }
+                }
+            },
+        );
+        if let Some((transport, enabled)) = transport_change {
+            self.set_transport_enabled(transport, enabled);
+        }
+        if let Some(connection) = &self.connection {
+            ui.label(format!("Gateway: {}", connection.host));
+            ui.label("QUIC → TLS → TCP (3 attempts each)");
+            if !connection.ca_file.is_empty() {
+                ui.label(format!("CA file: {}", connection.ca_file));
+            }
+        } else {
+            ui.colored_label(
+                Color32::LIGHT_RED,
+                "Create and configure .env, then restart the app.",
+            );
+        }
+        ui.small("Connection settings are loaded from .env at startup.");
     }
 
     fn request_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Request composer");
-        ui.horizontal_wrapped(|ui| {
-            for (label, name, params) in [
-                ("Echo", "echo", r#"{"message": "Hello, desktop!"}"#),
-                ("Sum", "sum", "[1, 2, 3, 4]"),
-                ("Named params", "greet", r#"{"name": "Desktop"}"#),
-                ("No params", "info", ""),
-                ("Remote error", "fail", "{}"),
-                ("Unknown method", "missing.method", ""),
-                ("Slow / cancel", "slow", r#"{"ms": 10000}"#),
-            ] {
-                if ui.button(label).clicked() {
-                    self.method = name.into();
-                    self.params = params.into();
-                }
+        let mut refresh_methods = false;
+        let previous_method = self.method.clone();
+        ui.horizontal(|ui| {
+            ui.label("Method");
+            egui::ComboBox::from_id_salt("request-method")
+                .selected_text(if self.method.is_empty() {
+                    "No implemented methods available"
+                } else {
+                    &self.method
+                })
+                .show_ui(ui, |ui| {
+                    for method in &self.methods {
+                        ui.selectable_value(&mut self.method, method.name.clone(), &method.name);
+                    }
+                });
+            if ui
+                .add_enabled(!self.methods_loading, egui::Button::new("Refresh methods"))
+                .clicked()
+            {
+                refresh_methods = true;
+            }
+            if self.methods_loading {
+                ui.spinner();
             }
         });
-        field(ui, "Method", &mut self.method);
+        if self.method != previous_method
+            && let Some(method) = self
+                .methods
+                .iter()
+                .find(|method| method.name == self.method)
+        {
+            self.params = method.example_params.clone();
+        }
+        if refresh_methods {
+            self.start_method_discovery();
+        }
+        if let Some(error) = &self.methods_error {
+            ui.colored_label(
+                Color32::LIGHT_RED,
+                format!("Could not load methods: {error}"),
+            );
+        } else if !self.methods_loading && self.methods.is_empty() {
+            ui.label("The Control Plane reported no implemented methods.");
+        }
+        if let Some(schema) = self
+            .methods
+            .iter()
+            .find(|method| method.name == self.method)
+            .and_then(|method| method.params_schema.as_ref())
+        {
+            egui::CollapsingHeader::new("Parameter schema from Control Plane").show(ui, |ui| {
+                ui.monospace(schema.to_string());
+            });
+        }
         ui.label("Parameters: JSON object or array; empty = omit params");
         ui.add(
             TextEdit::multiline(&mut self.params)
@@ -615,7 +1216,9 @@ impl DesktopApp {
                 .desired_rows(7)
                 .desired_width(f32::INFINITY),
         );
-        ui.add_enabled_ui(self.client.is_some(), |ui| {
+        let can_send =
+            self.client.is_some() && self.methods.iter().any(|method| method.name == self.method);
+        ui.add_enabled_ui(can_send, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Call").clicked() {
                     self.send_request(false, false);
@@ -627,7 +1230,18 @@ impl DesktopApp {
                 if ui.button("Parallel calls").clicked() {
                     self.send_request(false, true);
                 }
-                if ui.button("Typed greet").clicked() {
+                if self.method == "greet" && ui.button("Typed greet").clicked() {
+                    #[derive(Deserialize, serde::Serialize)]
+                    struct GreetingParams {
+                        name: String,
+                    }
+                    let params = match serde_json::from_str::<GreetingParams>(&self.params) {
+                        Ok(params) => params,
+                        Err(error) => {
+                            self.error(format!("Invalid typed greet example params: {error}"));
+                            return;
+                        }
+                    };
                     let client = self.client.as_ref().expect("enabled with client").0.clone();
                     self.run("Typed request<P, R>", async move {
                         #[derive(Deserialize, serde::Serialize)]
@@ -635,13 +1249,18 @@ impl DesktopApp {
                             message: String,
                             source: String,
                         }
-                        let result: Greeting = client
-                            .request("greet", json!({"name": "Rust / serde"}))
-                            .await?;
+                        let result: Greeting = client.request("greet", params).await?;
                         Ok(serde_json::to_value(result)?)
                     });
                 }
-                if ui.button("Typed info (no params)").clicked() {
+                if self.method == "info"
+                    && self
+                        .methods
+                        .iter()
+                        .find(|method| method.name == "info")
+                        .is_some_and(|method| method.example_params.is_empty())
+                    && ui.button("Typed info (no params)").clicked()
+                {
                     let client = self.client.as_ref().expect("enabled with client").0.clone();
                     self.run("request_without_params", async move {
                         Ok(client.request_without_params::<Value>("info").await?)
@@ -649,7 +1268,7 @@ impl DesktopApp {
                 }
             });
         });
-        ui.small("Demo methods require the local sandbox. Timeout: set Policy < slow.ms. Cancellation drops the local future; it cannot undo server side effects.");
+        ui.small("Timeout: configure Policy. Cancellation drops the local future; it cannot undo server-side effects.");
     }
 
     fn batch_tab(&mut self, ui: &mut egui::Ui) {
@@ -683,7 +1302,7 @@ impl DesktopApp {
         egui::Grid::new("policy").num_columns(2).show(ui, |ui| {
             for (label, value) in [
                 ("Request timeout (ms)", &mut self.policy.timeout_ms),
-                ("Ping interval (ms), 0 = off", &mut self.policy.ping_ms),
+                ("Ping interval (ms)", &mut self.policy.ping_ms),
                 ("Reconnect cooldown (ms)", &mut self.policy.cooldown_ms),
                 ("Maximum backoff (ms)", &mut self.policy.max_backoff_ms),
                 ("Reconnect jitter (ms)", &mut self.policy.jitter_ms),
@@ -698,6 +1317,9 @@ impl DesktopApp {
             }
             ui.label("Missed pongs before recovery");
             ui.add(egui::DragValue::new(&mut self.policy.missed_pongs));
+            ui.end_row();
+            ui.label("Failed restore attempts before reconnect");
+            ui.add(egui::DragValue::new(&mut self.policy.recovery_attempts));
             ui.end_row();
             ui.label("Outbound queue capacity");
             ui.add_enabled(
@@ -725,8 +1347,12 @@ impl DesktopApp {
                 Ok(_) => {
                     let client = self.client.as_ref().expect("enabled with client").0.clone();
                     let policy = self.policy.clone();
+                    let connection = self.connection.clone();
                     self.run("Apply policy", async move {
                         policy.apply(&client).await?;
+                        if let Some(connection) = connection {
+                            connection.set_recovery_attempts(policy.recovery_attempts);
+                        }
                         Ok(json!({"policy": "applied"}))
                     });
                 }
@@ -757,7 +1383,7 @@ impl DesktopApp {
                 }
             });
         });
-        ui.small("Automatic recovery requires periodic pings. It does not replay RPC requests. Reconnect metrics count library-managed recovery attempts, not these manual controls.");
+        ui.small("Periodic pings start automatically after connection. After the missed-pong threshold, the client retries restore before reconnecting with gateway fallback. RPC requests are not replayed.");
     }
 
     fn metrics_tab(&self, ui: &mut egui::Ui) {
@@ -866,19 +1492,66 @@ impl DesktopApp {
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.drain();
+        let transport_interval = self
+            .connection
+            .as_ref()
+            .map(|settings| Duration::from_secs(settings.gateway_up_return_sec))
+            .unwrap_or(Duration::from_secs(30));
+        if self.transports_initialized
+            && self.transport_operation.is_none()
+            && !self.return_in_progress
+            && !self.transports_loading
+            && self.last_transport_poll.elapsed() >= transport_interval
+        {
+            self.start_transport_discovery();
+        }
+        if self.client.is_some()
+            && let Some(result) = self.map.poll(
+                self.runtime
+                    .as_ref()
+                    .expect("runtime exists until shutdown"),
+            )
+        {
+            match result {
+                Ok(message) => self.log(Level::INFO, message),
+                Err(error) => self.error(error),
+            }
+        }
         ctx.request_repaint_after(Duration::from_millis(150));
+        let mut open_settings = false;
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(RichText::new("JSON-RPC-2").color(ACCENT));
                 ui.label("DESKTOP CLIENT LAB");
                 ui.separator();
-                ui.label(if self.client.is_some() {
-                    &self.session
+                if let Some((_, transport)) = &self.client {
+                    ui.label(format!(
+                        "{} / {}",
+                        transport.kind(),
+                        transport
+                            .peer()
+                            .unwrap_or_else(|| "peer not reported".into())
+                    ));
+                } else if self.control.is_some() {
+                    ui.label("Connecting...");
+                } else if self.connection.is_none() {
+                    ui.label("Gateway configuration required");
                 } else {
-                    "No open session"
+                    ui.label("No open session");
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button("Settings", |ui| {
+                        if ui.button("Application settings…").clicked() {
+                            open_settings = true;
+                            ui.close();
+                        }
+                    });
                 });
             });
         });
+        if open_settings {
+            self.open_settings();
+        }
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
@@ -903,6 +1576,7 @@ impl eframe::App for DesktopApp {
                     (Tab::Policy, "Policy & liveness"),
                     (Tab::Metrics, "Metrics"),
                     (Tab::Log, "Event log"),
+                    (Tab::Map, "Мапа"),
                 ] {
                     ui.selectable_value(&mut self.tab, tab, label);
                 }
@@ -917,6 +1591,7 @@ impl eframe::App for DesktopApp {
                         Tab::Policy => self.policy_tab(ui),
                         Tab::Metrics => self.metrics_tab(ui),
                         Tab::Log => self.log_tab(ui),
+                        Tab::Map => self.map.show(ui),
                     }
                     if !self.tasks.is_empty() {
                         ui.separator();
@@ -970,6 +1645,78 @@ impl eframe::App for DesktopApp {
                     );
                 });
         });
+        if self.settings_open {
+            let mut save_settings = false;
+            let mut close_settings = false;
+            egui::Window::new("Application settings (.env)")
+                .open(&mut self.settings_open)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.label("Changes are validated and saved to .env before reconnecting.");
+                    egui::Grid::new("settings-grid")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            let draft = self
+                                .settings_draft
+                                .get_or_insert_with(SettingsDraft::default);
+                            ui.label("Gateway host");
+                            ui.text_edit_singleline(&mut draft.host);
+                            ui.end_row();
+                            ui.label("Gateway port");
+                            ui.text_edit_singleline(&mut draft.port);
+                            ui.end_row();
+                            ui.label("TLS server name");
+                            ui.text_edit_singleline(&mut draft.server_name);
+                            ui.end_row();
+                            ui.label("CA file");
+                            ui.text_edit_singleline(&mut draft.ca_file);
+                            ui.end_row();
+                            ui.label("Connect timeout (ms)");
+                            ui.text_edit_singleline(&mut draft.connect_timeout_ms);
+                            ui.end_row();
+                            ui.label("Retry delay (ms)");
+                            ui.text_edit_singleline(&mut draft.retry_delay_ms);
+                            ui.end_row();
+                            ui.label("Control Plane port");
+                            ui.text_edit_singleline(&mut draft.control_port);
+                            ui.end_row();
+                            ui.label("Control Plane timeout (ms)");
+                            ui.text_edit_singleline(&mut draft.control_timeout_ms);
+                            ui.end_row();
+                            ui.label("Ping interval (ms)");
+                            ui.text_edit_singleline(&mut draft.ping_ms);
+                            ui.end_row();
+                            ui.label("Missed pongs");
+                            ui.text_edit_singleline(&mut draft.missed_pongs);
+                            ui.end_row();
+                            ui.label("Recovery attempts");
+                            ui.text_edit_singleline(&mut draft.recovery_attempts);
+                            ui.end_row();
+                            ui.label("GATEWAY_UP_RETURN_SEC (s)");
+                            ui.text_edit_singleline(&mut draft.gateway_up_return_sec);
+                            ui.end_row();
+                        });
+                    if let Some(error) = &self.settings_error {
+                        ui.colored_label(Color32::LIGHT_RED, error);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Save and reconnect").clicked() {
+                            save_settings = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close_settings = true;
+                        }
+                    });
+                });
+            if save_settings {
+                self.save_settings();
+            } else if close_settings || !self.settings_open {
+                self.settings_open = false;
+                self.settings_draft = None;
+                self.settings_error = None;
+            }
+        }
     }
 }
 
@@ -981,7 +1728,7 @@ impl Drop for DesktopApp {
         if let Some(task) = self.control.take() {
             task.abort();
         }
-        if let Some(task) = self.server_control.take() {
+        if let Some(task) = self.method_discovery.take() {
             task.abort();
         }
         if let Some(runtime) = self.runtime.take() {
@@ -992,26 +1739,8 @@ impl Drop for DesktopApp {
                         result => eprintln!("Client shutdown failed: {result:?}"),
                     }
                 }
-                if let Some(server) = self.server.take() {
-                    match tokio::time::timeout(Duration::from_secs(3), server.close()).await {
-                        Ok(Ok(())) => {}
-                        result => eprintln!("Demo shutdown failed: {result:?}"),
-                    }
-                }
             });
             runtime.shutdown_timeout(Duration::from_secs(2));
         }
     }
-}
-
-fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
-    ui.label(label);
-    ui.add(TextEdit::singleline(value).desired_width(f32::INFINITY));
-}
-
-fn number<N: egui::emath::Numeric>(ui: &mut egui::Ui, label: &str, value: &mut N) {
-    ui.horizontal(|ui| {
-        ui.label(label);
-        ui.add(egui::DragValue::new(value));
-    });
 }

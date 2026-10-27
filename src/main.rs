@@ -1,3 +1,4 @@
+mod ecosystem_map;
 mod ui;
 
 fn main() -> eframe::Result {

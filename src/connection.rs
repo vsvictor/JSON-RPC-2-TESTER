@@ -1,4 +1,16 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    env,
+    future::Future,
+    io::ErrorKind,
+    net::SocketAddr,
+    path::Path,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
@@ -14,6 +26,195 @@ use json_rpc_2::{
 
 pub type Client = RpcClient<Arc<dyn RpcClientTransport>>;
 pub type Transport = Arc<dyn RpcClientTransport>;
+
+const GATEWAY_TRANSPORTS: [(&str, u8); 3] = [("quic", 0), ("tls", 1), ("tcp", 2)];
+const ATTEMPTS_PER_TRANSPORT: usize = 3;
+
+#[derive(Clone)]
+pub struct GatewaySettings {
+    pub host: String,
+    pub port: u16,
+    pub server_name: String,
+    pub ca_file: String,
+    pub ca_pem: String,
+    pub connect_timeout_ms: u64,
+    pub retry_delay_ms: u64,
+    pub control_port: u16,
+    pub control_timeout_ms: u64,
+    pub recovery_attempts: Arc<AtomicU32>,
+    pub transport_policy: Arc<AtomicU8>,
+    pub gateway_up_return_sec: u64,
+}
+
+async fn restore_until_success<F, Fut>(
+    attempts: u32,
+    retry_delay: Duration,
+    mut restore: F,
+) -> std::result::Result<(), TransportError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<(), TransportError>>,
+{
+    let mut last_error = None;
+    for attempt in 1..=attempts {
+        match restore().await {
+            Ok(()) => {
+                tracing::info!(attempt, "Transport restored");
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::warn!(attempt, attempts, error = %error, "Transport restore attempt failed");
+                last_error = Some(error);
+                if attempt < attempts && !retry_delay.is_zero() {
+                    tokio::time::sleep(retry_delay).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| TransportError::new("No restore attempts configured")))
+}
+
+impl GatewaySettings {
+    pub fn from_env() -> Result<Self> {
+        match dotenvy::from_path(Path::new(env!("CARGO_MANIFEST_DIR")).join(".env")) {
+            Ok(_) => {}
+            Err(dotenvy::Error::Io(error)) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Loading .env file"),
+        }
+
+        let settings = Self {
+            host: required_env("GATEWAY_HOST")?,
+            port: required_env("GATEWAY_PORT")?,
+            server_name: required_env("GATEWAY_TLS_SERVER_NAME")?,
+            ca_file: required_env("GATEWAY_CA_FILE")?,
+            ca_pem: String::new(),
+            connect_timeout_ms: env_or("GATEWAY_CONNECT_TIMEOUT_MS", 10_000)?,
+            retry_delay_ms: env_or("GATEWAY_RETRY_DELAY_MS", 500)?,
+            control_port: required_env("GATEWAY_CONTROL_PORT")?,
+            control_timeout_ms: env_or("GATEWAY_CONTROL_TIMEOUT_MS", 5_000)?,
+            recovery_attempts: Arc::new(AtomicU32::new(3)),
+            transport_policy: Arc::new(AtomicU8::new(0b0000_0111)),
+            gateway_up_return_sec: env_or("GATEWAY_UP_RETURN_SEC", 30)?,
+        };
+        let mut settings = settings;
+        settings.ca_pem = std::fs::read_to_string(&settings.ca_file)
+            .with_context(|| format!("Reading trusted gateway CA file {}", settings.ca_file))?;
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.host.trim().is_empty(),
+            "GATEWAY_HOST must not be empty"
+        );
+        ensure!(
+            !self.server_name.trim().is_empty(),
+            "GATEWAY_TLS_SERVER_NAME must not be empty"
+        );
+        ensure!(
+            !self.ca_pem.trim().is_empty(),
+            "GATEWAY_CA_FILE must contain trusted CA PEM"
+        );
+        ensure!(self.port != 0, "GATEWAY_PORT must be nonzero");
+        ensure!(
+            self.control_port != 0,
+            "GATEWAY_CONTROL_PORT must be nonzero"
+        );
+        ensure!(
+            self.connect_timeout_ms != 0 && self.control_timeout_ms != 0,
+            "Gateway timeouts must be positive"
+        );
+        ensure!(
+            self.gateway_up_return_sec > 0,
+            "GATEWAY_UP_RETURN_SEC must be positive"
+        );
+        Ok(())
+    }
+
+    pub fn set_recovery_attempts(&self, attempts: u32) {
+        self.recovery_attempts.store(attempts, Ordering::Relaxed);
+    }
+
+    pub fn set_transport_policy(&self, enabled: [bool; 3], prefer_reverse: bool) {
+        let enabled_mask = enabled
+            .iter()
+            .enumerate()
+            .fold(0u8, |mask, (index, enabled)| {
+                mask | (u8::from(*enabled) << index)
+            });
+        self.transport_policy.store(
+            enabled_mask | (u8::from(prefer_reverse) << 3),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn candidates(&self) -> Result<Vec<(&'static str, u16)>> {
+        let policy = self.transport_policy.load(Ordering::Relaxed);
+        let enabled_mask = policy & 0b0000_0111;
+        let order: [&'static str; 3] = if policy & 0b0000_1000 == 0 {
+            ["quic", "tls", "tcp"]
+        } else {
+            ["tcp", "tls", "quic"]
+        };
+        let candidates = order
+            .into_iter()
+            .filter(|kind| {
+                let index = GATEWAY_TRANSPORTS
+                    .iter()
+                    .find_map(|(name, index)| (*name == *kind).then_some(*index))
+                    .expect("all ordered gateway transports exist");
+                enabled_mask & (1 << index) != 0
+            })
+            .map(|kind| (kind, self.port))
+            .collect::<Vec<_>>();
+        ensure!(
+            !candidates.is_empty(),
+            "All Gateway transport profiles are disabled"
+        );
+        Ok(candidates)
+    }
+
+    fn connection(&self, transport: &'static str, port: u16) -> ConnectionSettings {
+        let choice = *TRANSPORTS
+            .iter()
+            .find(|choice| choice.id == transport)
+            .expect("gateway transport exists in the transport catalog");
+        ConnectionSettings {
+            choice,
+            host: self.host.clone(),
+            port,
+            server_name: self.server_name.clone(),
+            ca_pem: self.ca_pem.clone(),
+            connect_timeout_ms: self.connect_timeout_ms,
+            ..ConnectionSettings::default()
+        }
+    }
+}
+
+fn required_env<T: FromStr>(key: &str) -> Result<T>
+where
+    T::Err: std::fmt::Display,
+{
+    let value =
+        env::var(key).with_context(|| format!("Reading required environment variable {key}"))?;
+    value
+        .parse()
+        .map_err(|error: T::Err| anyhow::anyhow!("Invalid {key}: {error}"))
+}
+
+fn env_or<T: FromStr>(key: &str, default: T) -> Result<T>
+where
+    T::Err: std::fmt::Display,
+{
+    match env::var(key) {
+        Ok(value) => value
+            .parse()
+            .map_err(|error: T::Err| anyhow::anyhow!("Invalid {key}: {error}")),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(error).with_context(|| format!("Reading environment variable {key}")),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransportChoice {
@@ -219,6 +420,7 @@ pub struct RuntimeSettings {
     pub timeout_ms: u64,
     pub ping_ms: u64,
     pub missed_pongs: u32,
+    pub recovery_attempts: u32,
     pub queue_capacity: usize,
     pub max_in_flight: usize,
     pub restore_first: bool,
@@ -232,8 +434,9 @@ impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
             timeout_ms: 5000,
-            ping_ms: 0,
+            ping_ms: 10_000,
             missed_pongs: 3,
+            recovery_attempts: 3,
             queue_capacity: 256,
             max_in_flight: 64,
             restore_first: true,
@@ -246,11 +449,27 @@ impl Default for RuntimeSettings {
 }
 
 impl RuntimeSettings {
+    pub fn from_env() -> Result<Self> {
+        let settings = Self {
+            ping_ms: env_or("GATEWAY_PING_INTERVAL_MS", 10_000)?,
+            missed_pongs: env_or("GATEWAY_MISSED_PONGS", 3)?,
+            recovery_attempts: env_or("GATEWAY_RECOVERY_ATTEMPTS", 3)?,
+            ..Self::default()
+        };
+        settings.config()?;
+        Ok(settings)
+    }
+
     pub fn config(&self) -> Result<RpcClientConfig> {
         ensure!(self.timeout_ms > 0, "Request timeout must be positive");
+        ensure!(self.ping_ms > 0, "Ping interval must be positive");
         ensure!(
             self.missed_pongs > 0,
             "Missed pong threshold must be positive"
+        );
+        ensure!(
+            self.recovery_attempts > 0,
+            "Recovery attempts must be positive"
         );
         ensure!(
             self.queue_capacity > 0 && self.max_in_flight > 0,
@@ -393,6 +612,223 @@ pub async fn connect(
         ));
     }
     Ok((client, transport))
+}
+
+pub async fn connect_gateway(
+    settings: GatewaySettings,
+    runtime: RuntimeSettings,
+) -> Result<(Client, Transport)> {
+    settings.validate()?;
+    let config = runtime.config()?;
+    let inner = connect_gateway_transport(&settings).await?;
+    let transport: Transport = Arc::new(GatewaySession {
+        inner: tokio::sync::RwLock::new(inner.0),
+        settings,
+        active_transport: AtomicU8::new(inner.1),
+        reconnect_lock: tokio::sync::Mutex::new(()),
+    });
+    let client = client_for_transport(transport.clone(), config).await?;
+    Ok((client, transport))
+}
+
+async fn client_for_transport(transport: Transport, config: RpcClientConfig) -> Result<Client> {
+    let client = Client::new_with_config(transport, config.clone())?;
+    // Construction stores liveness policy; set_config starts the periodic task.
+    if let Err(error) = client.set_config(config).await {
+        let close_result = client.close().await;
+        return Err(anyhow::anyhow!(
+            "Applying client policy failed: {error}; cleanup: {close_result:?}"
+        ));
+    }
+    Ok(client)
+}
+
+async fn connect_gateway_transport(settings: &GatewaySettings) -> Result<(Transport, u8)> {
+    let candidates = settings.candidates()?;
+    let (transport, kind, _) = try_candidates(
+        &candidates,
+        ATTEMPTS_PER_TRANSPORT,
+        Duration::from_millis(settings.retry_delay_ms),
+        |kind, port| {
+            let connection = settings.connection(kind, port);
+            async move {
+                connection.validate()?;
+                tokio::time::timeout(
+                    Duration::from_millis(connection.connect_timeout_ms),
+                    create_transport(&connection),
+                )
+                .await
+                .context("Connection attempt timed out")?
+            }
+        },
+    )
+    .await?;
+    let active_transport = GATEWAY_TRANSPORTS
+        .iter()
+        .find_map(|(candidate, index)| (*candidate == kind).then_some(*index))
+        .expect("gateway transport exists in the fallback sequence");
+    Ok((transport, active_transport))
+}
+
+async fn try_candidates<T, F, Fut>(
+    candidates: &[(&'static str, u16)],
+    attempts_per_candidate: usize,
+    retry_delay: Duration,
+    mut attempt: F,
+) -> Result<(T, &'static str, u16)>
+where
+    F: FnMut(&'static str, u16) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    ensure!(
+        attempts_per_candidate > 0,
+        "At least one connection attempt is required"
+    );
+    let mut errors = Vec::new();
+    for &(kind, port) in candidates {
+        for attempt_number in 1..=attempts_per_candidate {
+            match attempt(kind, port).await {
+                Ok(value) => {
+                    tracing::info!(
+                        transport = kind,
+                        port,
+                        attempt = attempt_number,
+                        "Connected to gateway"
+                    );
+                    return Ok((value, kind, port));
+                }
+                Err(error) => {
+                    let detail = format!(
+                        "{kind} attempt {attempt_number}/{attempts_per_candidate}: {error:#}"
+                    );
+                    tracing::warn!(transport = kind, port, attempt = attempt_number, error = %error, "Gateway connection attempt failed");
+                    errors.push(detail);
+                }
+            }
+            if attempt_number < attempts_per_candidate && !retry_delay.is_zero() {
+                tokio::time::sleep(retry_delay).await;
+            }
+        }
+    }
+    bail!(
+        "All gateway connection attempts failed: {}",
+        errors.join("; ")
+    )
+}
+
+struct GatewaySession {
+    inner: tokio::sync::RwLock<Transport>,
+    settings: GatewaySettings,
+    active_transport: AtomicU8,
+    reconnect_lock: tokio::sync::Mutex<()>,
+}
+
+impl GatewaySession {
+    fn active(&self) -> (&'static str, u16) {
+        match self.active_transport.load(Ordering::Relaxed) {
+            0 => ("quic", self.settings.port),
+            1 => ("tls", self.settings.port),
+            _ => ("tcp", self.settings.port),
+        }
+    }
+}
+
+impl RpcClientTransport for GatewaySession {
+    fn send<'a>(&'a self, message: Bytes) -> ClientTransportFuture<'a> {
+        Box::pin(async move { self.inner.read().await.send(message).await })
+    }
+
+    fn send_message<'a>(
+        &'a self,
+        message: TransportMessage,
+        expects_response: bool,
+    ) -> ClientTransportFuture<'a> {
+        Box::pin(async move {
+            self.inner
+                .read()
+                .await
+                .send_message(message, expects_response)
+                .await
+        })
+    }
+
+    fn send_with_expectation<'a>(
+        &'a self,
+        message: Bytes,
+        expects_response: bool,
+    ) -> ClientTransportFuture<'a> {
+        Box::pin(async move {
+            self.inner
+                .read()
+                .await
+                .send_with_expectation(message, expects_response)
+                .await
+        })
+    }
+
+    fn send_cancelable<'a>(
+        &'a self,
+        message: Bytes,
+        expects_response: bool,
+        cancel: CancellationToken,
+    ) -> ClientTransportFuture<'a> {
+        Box::pin(async move {
+            self.inner
+                .read()
+                .await
+                .send_cancelable(message, expects_response, cancel)
+                .await
+        })
+    }
+
+    fn kind(&self) -> &'static str {
+        self.active().0
+    }
+
+    fn peer(&self) -> Option<String> {
+        let (kind, port) = self.active();
+        Some(format!("{kind}://{}:{port}", self.settings.host))
+    }
+
+    fn transport_ping<'a>(&'a self) -> ClientPingFuture<'a> {
+        Box::pin(async move { self.inner.read().await.transport_ping().await })
+    }
+
+    fn restore<'a>(&'a self) -> ClientRecoverFuture<'a> {
+        Box::pin(async move {
+            let attempts = self.settings.recovery_attempts.load(Ordering::Relaxed);
+            restore_until_success(
+                attempts,
+                Duration::from_millis(self.settings.retry_delay_ms),
+                || async { self.inner.read().await.restore().await },
+            )
+            .await
+        })
+    }
+
+    fn reconnect<'a>(&'a self) -> ClientRecoverFuture<'a> {
+        Box::pin(async move {
+            let _guard = self.reconnect_lock.lock().await;
+            let replacement = connect_gateway_transport(&self.settings)
+                .await
+                .map_err(|error| TransportError::new(format!("{error:#}")))?;
+            let previous = std::mem::replace(&mut *self.inner.write().await, replacement.0);
+            self.active_transport
+                .store(replacement.1, Ordering::Relaxed);
+            if let Err(error) = previous.close().await {
+                tracing::warn!(error = %error, "Previous gateway transport could not be closed cleanly");
+            }
+            tracing::info!(
+                transport = self.kind(),
+                "Gateway transport reconnected with fallback"
+            );
+            Ok(())
+        })
+    }
+
+    fn close<'a>(&'a self) -> ClientCloseFuture<'a> {
+        Box::pin(async move { self.inner.read().await.close().await })
+    }
 }
 
 // These upstream WebSocket carriers wait for endpoint-wide idleness when closing.
@@ -690,4 +1126,208 @@ async fn create_transport(s: &ConnectionSettings) -> Result<Transport> {
         other => bail!("Transport {other} is not available in this build"),
     };
     Ok(transport)
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    use std::sync::{Mutex, atomic::AtomicUsize};
+
+    fn gateway_settings() -> GatewaySettings {
+        GatewaySettings {
+            host: "gateway".into(),
+            port: 18080,
+            server_name: "gateway".into(),
+            ca_file: String::new(),
+            ca_pem: String::new(),
+            connect_timeout_ms: 100,
+            retry_delay_ms: 0,
+            control_port: 18500,
+            control_timeout_ms: 100,
+            recovery_attempts: Arc::new(AtomicU32::new(3)),
+            transport_policy: Arc::new(AtomicU8::new(0b0000_0111)),
+            gateway_up_return_sec: 30,
+        }
+    }
+
+    #[test]
+    fn runtime_policy_configures_ping_threshold_and_recovery_attempts() {
+        let settings = RuntimeSettings {
+            ping_ms: 1_500,
+            missed_pongs: 4,
+            recovery_attempts: 2,
+            ..RuntimeSettings::default()
+        };
+        let config = settings.config().unwrap();
+        assert_eq!(
+            config.liveness.ping_frequency,
+            Some(Duration::from_millis(1_500))
+        );
+        assert_eq!(config.liveness.max_missed_pongs, 4);
+        assert!(
+            RuntimeSettings {
+                ping_ms: 0,
+                ..settings.clone()
+            }
+            .config()
+            .is_err()
+        );
+        assert!(
+            RuntimeSettings {
+                recovery_attempts: 0,
+                ..settings
+            }
+            .config()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn transport_policy_filters_disabled_profiles_and_changes_preference() {
+        let settings = gateway_settings();
+        assert_eq!(
+            settings.candidates().unwrap(),
+            [("quic", 18080), ("tls", 18080), ("tcp", 18080)]
+        );
+
+        settings.set_transport_policy([false, true, true], false);
+        assert_eq!(
+            settings.candidates().unwrap(),
+            [("tls", 18080), ("tcp", 18080)]
+        );
+
+        settings.set_transport_policy([true, true, false], false);
+        assert_eq!(
+            settings.candidates().unwrap(),
+            [("quic", 18080), ("tls", 18080)]
+        );
+        settings.set_transport_policy([true, false, false], false);
+        assert_eq!(settings.candidates().unwrap(), [("quic", 18080)]);
+
+        settings.set_transport_policy([true, true, true], true);
+        assert_eq!(
+            settings.candidates().unwrap(),
+            [("tcp", 18080), ("tls", 18080), ("quic", 18080)]
+        );
+
+        settings.set_transport_policy([false, false, false], false);
+        assert!(settings.candidates().is_err());
+    }
+
+    #[tokio::test]
+    async fn restores_until_success_or_exhausts_configured_attempts() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_restore = Arc::clone(&calls);
+        let result = restore_until_success(4, Duration::ZERO, move || {
+            let attempt = calls_for_restore.fetch_add(1, Ordering::Relaxed);
+            async move {
+                if attempt < 2 {
+                    Err(TransportError::new("temporary failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_restore = Arc::clone(&calls);
+        let result = restore_until_success(3, Duration::ZERO, move || {
+            calls_for_restore.fetch_add(1, Ordering::Relaxed);
+            async { Err(TransportError::new("unavailable")) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn retries_each_transport_three_times_before_falling_back() {
+        let tried = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::clone(&tried);
+        let (port, transport, _) = try_candidates(
+            &[("quic", 1), ("tls", 2), ("tcp", 3)],
+            ATTEMPTS_PER_TRANSPORT,
+            Duration::ZERO,
+            move |kind, port| {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    attempts.lock().unwrap().push((kind, port));
+                    if kind == "tcp" {
+                        Ok(port)
+                    } else {
+                        bail!("not listening")
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(port, 3);
+        assert_eq!(transport, "tcp");
+        assert_eq!(
+            *tried.lock().unwrap(),
+            vec![
+                ("quic", 1),
+                ("quic", 1),
+                ("quic", 1),
+                ("tls", 2),
+                ("tls", 2),
+                ("tls", 2),
+                ("tcp", 3),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_failure_after_three_attempts_on_all_transports() {
+        let tried = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::clone(&tried);
+        let result: Result<((), &'static str, u16)> = try_candidates(
+            &[("quic", 1), ("tls", 2), ("tcp", 3)],
+            ATTEMPTS_PER_TRANSPORT,
+            Duration::ZERO,
+            move |kind, port| {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    attempts.lock().unwrap().push((kind, port));
+                    bail!("not listening")
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(tried.lock().unwrap().len(), 9);
+        assert_eq!(
+            tried
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(kind, _)| *kind == "quic")
+                .count(),
+            3
+        );
+        assert_eq!(
+            tried
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(kind, _)| *kind == "tls")
+                .count(),
+            3
+        );
+        assert_eq!(
+            tried
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(kind, _)| *kind == "tcp")
+                .count(),
+            3
+        );
+    }
 }

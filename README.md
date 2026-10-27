@@ -12,10 +12,29 @@ C/C++ toolchain. Залежності бібліотеки зафіксован�
 використовуйте `--locked` для відтворюваного збирання.
 
 ```sh
+cp .env.example .env
+# Вкажіть host, порти gateway, TLS server name та шлях до CA PEM.
 cargo run --locked
 # Оптимізований застосунок:
 cargo run --locked --release
 ```
+
+Апка читає конфігурацію шлюзу з `.env` (або змінних середовища процесу) і
+підключається під час запуску. Задайте `GATEWAY_HOST`,
+`GATEWAY_PORT` (один ingress-порт для QUIC, TLS і TCP), `GATEWAY_TLS_SERVER_NAME`,
+`GATEWAY_CA_FILE` (довірений CA PEM) і
+`GATEWAY_CONTROL_PORT`. Тайм-аути підключення та повторів теж задаються в
+`.env.example`. `GATEWAY_PING_INTERVAL_MS` задає періодичність ping;
+`GATEWAY_MISSED_PONGS` і `GATEWAY_RECOVERY_ATTEMPTS` задають поріг пропущених
+pong та кількість спроб відновити поточний транспорт перед повним перепідключенням.
+`GATEWAY_UP_RETURN_SEC` задає інтервал моніторингу стану транспортів і спроб
+повернутися на бажаний транспорт (типово 30 секунд).
+RPC-підключення тричі пробує QUIC, потім тричі TLS і тричі TCP.
+Усі RPC-вкладки використовують одну сесію; окремий канал Control Plane
+підключається тим самим транспортом, що й активна Gateway-сесія.
+Якщо `.env` або обов’язкові значення відсутні чи некоректні, апка відкриється
+з повідомленням про помилку конфігурації замість аварійного завершення;
+після виправлення `.env` перезапустіть її.
 
 У RustRover працює наявна Cargo-конфігурація **Run**.
 Linux потребує графічної сесії X11 або Wayland. Типові пакети Debian/Ubuntu для
@@ -25,33 +44,63 @@ Linux потребує графічної сесії X11 або Wayland. Тип�
 Build Tools. Інтеграційні перевірки в цьому середовищі виконуються на Linux;
 підтримка окремих транспортів залежить також від upstream-бібліотеки й ОС.
 
-### Перший сценарій без зовнішніх сервісів
-
-1. Натисніть **Start demo server**. Сервер слухає тільки `127.0.0.1`,
-   вибирає вільні порти та автоматично підставляє TCP endpoint.
-2. Натисніть **Connect**, потім **Call**. Метод `echo` поверне ваш JSON.
-3. Спробуйте пресети, **Notify**, **Typed greet**, **Parallel calls**, вкладки
-   **Batch**, **Policy & liveness**, **Metrics** та **Event log**.
-
-**Use demo endpoint** дозволяє вибрати будь-який із 16 локальних транспортів.
-Для TLS/QUIC застосунок генерує тимчасовий сертифікат `localhost` і явно
-довіряє йому тільки в налаштуваннях цього клієнта. Ключ не записується на диск,
-системне сховище довіри не змінюється, перевірка імені сервера не вимикається.
-Сертифікат і порти змінюються після перезапуску демосервера.
-
 ## Можливості клієнта
 
 | Екран | Що демонструється |
 | --- | --- |
-| Connection | Вибір транспорту, DNS/IP/IPv6, порт, тайм-аут підключення, TLS server name, CA PEM з тексту або файлу, WebSocket path |
-| Request | `request_value`, структуровані object/array params, відсутні params, `notify`, типізоване `request<P, R>` із serde та `request_without_params<R>` |
+| Gateway connection | Автоматичне підключення зі значень `.env`; QUIC → TLS → TCP, по три спроби на транспорт; спільна RPC-сесія для всіх вкладок |
+| Request | `list_methods` із Control Plane; вибір лише оголошених backend-методів і підстановка кожного зразка `method_details.example_request.params`, перегляд `params_schema`, структуровані object/array params, відсутні params, `notify`, типізоване `request<P, R>` із serde та `request_without_params<R>` |
 | Batch | Змішані виклики/сповіщення, автоматичні ID, кореляція результатів у порядку вхідних викликів, окремі remote errors; notification-only batch |
 | Parallel calls | Клонування клієнта зі спільною сесією та ID; 1–64 конкурентних запити, окремий результат/помилка кожного |
-| Policy & liveness | Тайм-аут запитів, ping interval, missed pong threshold, restore-before-reconnect, cooldown/backoff/jitter/budget, черга та in-flight limit |
-| Transport controls | Транспортний ping/pong без RPC, restore, reconnect |
+| Policy & liveness | Автоматичний ping за `GATEWAY_PING_INTERVAL_MS`; поріг missed pong і кількість повторів restore задаються в `.env` та змінюються в Runtime policy; після вичерпання restore виконується Gateway fallback reconnect |
+| Transport controls | Транспортний ping/pong без RPC, restore, reconnect із повтором gateway fallback; панель Connection читає `list_transports` і надсилає `set_transport_enabled` для профілів QUIC/TLS/TCP |
 | Running operations | Скасування конкретної операції або всіх, включно з паралельними дочірніми запитами |
 | Metrics | Справжній `ClientMetricsSnapshot`: активні запити, черга, RPC calls/errors, timeouts, cancellations, recovery attempts, missed pongs; застосована конфігурація |
 | Event log | Події `tracing` бібліотеки, liveness/recovery, фільтр, рівні, копіювання; опційний DEBUG/TRACE |
+| Мапа | Граф Gateway → in-process Balancer → backend-и; ingress endpoints, circuit breakers та зайнятість connection pools через Control Plane |
+
+### Мапа екосистеми Gateway
+
+Вкладка **Мапа** автоматично опитує Control Plane gateway-а за портом
+`GATEWAY_CONTROL_PORT`. Це окремий канал до того самого gateway, незалежний
+від спільної RPC-сесії. Наразі Control Plane примусово використовує TCP
+незалежно від транспорту основної Gateway-сесії; надсилається команда
+`{"action":"list_components"}`, а не JSON-RPC envelope. Інтервал оновлення
+можна змінювати у вкладці; host і порт беруться зі спільної конфігурації `.env`.
+
+Мапа показує версію/PID/uptime gateway-а, ingress listeners, control/metrics
+адреси, версію та режим виконання balancer-а, всі налаштовані backend-и,
+їхні host/transport/port, pool size та idle/empty/busy slots. Circuit states
+позначені кольорами: `closed` — бірюзовий, `open` — червоний, `half_open` —
+жовтий; також показані failures, retry delay або probe-in-flight відповідно.
+Масштаб і прокрутка дозволяють переглянути великий граф; наведення на вузол
+показує повний текст адрес та станів. Оновлення автоматичне, також під час
+перегляду інших вкладок. TCP-з'єднання Control Plane повторно використовує
+сесію для наступних запитів. Новий запит починається через заданий інтервал після завершення
+попереднього, без накладання запитів. Інтервал можна змінювати під час роботи.
+При обриві чи тайм-ауті остання мапа зберігається з повідомленням про помилку
+та віком знімка, а наступне оновлення повторно підключається до Control Plane.
+Підключення мапи запускається разом із застосунком; її окремий канал
+перепідключається на наступному циклі оновлення. Опитування починається після
+успішного підключення основної Gateway-сесії.
+
+Панель **Connection** отримує стан транспортних профілів через Control Plane.
+Перемикач надсилає `set_transport_enabled`; вимкнення профілю закриває його
+активні сесії та відхиляє нові. Повторне ввімкнення дозволяє нові сесії, але
+не відновлює ті, що були закриті. Вимкнення активного профілю запускає
+перепідключення з порядком QUIC → TLS → TCP.
+Кожні `GATEWAY_UP_RETURN_SEC` секунд TCP-сесія пробує перейти на QUIC,
+а за невдачі — TLS; TLS-сесія пробує лише QUIC. Спроба створює новий транспорт,
+поки попередня сесія обслуговує запити; стара закривається лише після успіху.
+Невдалі спроби зберігають поточну сесію й повторюються через той самий інтервал.
+Під час fallback вимкнені профілі пропускаються.
+
+Це **неатомарний знімок конфігурації та локального стану пулів**, не активна
+перевірка здоров'я. Closed circuit або наявний connection не доводить, що
+backend-процес працює. Стрілки — налаштовані зв'язки, не виміряний трафік.
+Вік знімка й endpoint джерела показані явно. Control Plane не має
+автентифікації: використовуйте лише приватну мережу або захищений тунель,
+не відкривайте його публічно. Відповідь обмежена 4 MiB.
 
 Форма **Policy** застосовується при підключенні. **Apply policy** оновлює
 відкриту сесію. Upstream дозволяє міняти місткість черги лише при створенні
@@ -66,9 +115,11 @@ RPC-виклики**.
 
 ### Транспорти
 
-У каталозі 30 варіантів; недоступні в поточному build/ОС позначені явно.
+Бібліотека містить 30 транспортних реалізацій для інтеграційних перевірок.
+GUI-клієнт навмисно використовує тільки gateway ingress з fallback QUIC → TLS
+→ TCP; інші варіанти з таблиці не є доступними опціями підключення в апці.
 
-| Група | Варіанти | Локальний демосервер |
+| Група | Варіанти | Тестовий демосервер |
 | --- | --- | --- |
 | TCP/HTTP | TCP, TLS/TCP, HTTP/1.1 | Так |
 | Datagram | reliable UDP, RTP/RTCP, RUDP | Так |
@@ -78,19 +129,10 @@ RPC-виклики**.
 | SRT | native SRT та WS/SRT | Зовнішній сервер; feature `native-srt` |
 | IoT | MQTT, CoAP, AMQP та їх WS-варіанти | Зовнішній peer; для MQTT/AMQP потрібні broker та RPC consumer |
 
-Транспортний selector має стартові порти-підказки, які можна змінювати.
-Під час вибору локального endpoint використовуються фактичні динамічні порти,
-а не ці підказки. Для зовнішнього сервера введіть його реальні параметри.
-
-MQTT/AMQP налаштовуються через **broker URL**, **request topic/queue** та
-окремі operation/response timeouts. MQTT підтримує custom CA PEM; AMQP
-використовує системні корені довіри. Звичайний broker сам не виконує RPC:
-потрібен відповідний consumer, наприклад
+Інші реалізації транспорту лишаються в бібліотеці та інтеграційних тестах, але
+не доступні для вибору в GUI. Повний огляд специфічних параметрів MQTT/AMQP,
+SRT і kernel-specific transport-ів наведено в документації upstream:
 [gateway-iot](https://github.com/vsvictor/JSON-RPC-2/blob/0a5cee9c7cd5e2e1ecb4c123c3f99bceeaf6044f/docs/BROKER-INTEGRATION.md).
-
-UDP-Lite має send/receive checksum coverage (`0` — весь пакет, інакше `>= 8`).
-Для TCP-сімейства доступні TCP_NODELAY, BBR і Fast Open; непідтримувані
-системою опції повертають помилку, а не ігноруються.
 
 WS/TCP у цій бібліотеці — окрема raw WebSocket-сесія **без HTTP Upgrade**.
 Для звичайного `ws://.../ws` використовуйте **ws-http1**; для `wss://` —
@@ -143,6 +185,8 @@ src/ui.rs           egui, асинхронні операції, bounded event l
 src/connection.rs   каталог, валідація, transports, TLS, runtime policy
 src/requests.rs     params/batch parsing, parallel calls, error presentation
 src/demo.rs         localhost sandbox, ephemeral TLS identity
+src/ecosystem.rs    Control Plane commands, typed inventory, bounded transport reads
+src/ecosystem_map.rs graphical ecosystem map, discovery lifecycle
 tests/showcase.rs   реальні мережеві інтеграційні сценарії
 ```
 
@@ -162,6 +206,9 @@ cancellation cleanup, live policy та відмова TLS при неправи�
 localhost TCP/UDP sockets, але не GUI, broker або зовнішній RPC-сервер.
 SRT/IoT/kernel-specific з'єднання потребують окремого середовища; стандартні
 тести не стверджують їх мережеву сумісність.
+Тести Control Plane перевіряють точні байти команди, фрагментовану відповідь,
+усі circuit states, порожній inventory, відмови, невалідні/незавершені та
+завеликі відповіді й тайм-аут.
 
 ### Важливі upstream-деталі
 
@@ -176,12 +223,12 @@ SRT/IoT/kernel-specific з'єднання потребують окремого 
 
 ## Дані та обмеження
 
-Налаштування, PEM, паролі та журнал не зберігаються на диск. Лог обмежений
-500 подіями, відображення одного запису/результату — 32 KiB; обрізання й
-переповнення черги позначаються явно. Повні результати більших відповідей
-потребують окремого клієнтського коду. DEBUG/TRACE можуть містити credentials,
-params і персональні дані — вмикайте їх свідомо, не публікуйте чутливий журнал.
-Копіювання результату/журналу в clipboard здійснюється тільки кнопкою.
+Конфігурація читається з `.env`, а довірений CA — з указаного в ньому PEM-файлу;
+застосунок їх не змінює. Лог обмежений 500 подіями, відображення одного
+запису/результату — 32 KiB; обрізання й переповнення черги позначаються явно.
+DEBUG/TRACE можуть містити credentials, params і персональні дані — вмикайте їх
+свідомо, не публікуйте чутливий журнал. Копіювання в clipboard здійснюється
+тільки кнопкою.
 
 «Session open» означає створену клієнтську сесію, а не постійну гарантію
 досяжності peer. Для стану мережі використовуйте ping, missed pongs та події
