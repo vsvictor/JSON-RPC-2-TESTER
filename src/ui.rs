@@ -74,6 +74,15 @@ enum Event {
         enabled: bool,
         result: Result<()>,
     },
+    BackendsLoaded {
+        generation: u64,
+        result: Result<Vec<ecosystem::ManagedBackend>>,
+    },
+    BackendOperationFinished {
+        generation: u64,
+        label: String,
+        result: Result<()>,
+    },
     Finished {
         id: u64,
         label: String,
@@ -171,6 +180,39 @@ where
         .trim()
         .parse()
         .map_err(|error| anyhow!("Invalid {key}: {error}"))
+}
+
+fn parse_backend_registration(
+    id: &str,
+    host: &str,
+    ports: &str,
+    pool_size: &str,
+) -> Result<ecosystem::BackendRegistration> {
+    let id = id.trim();
+    let host = host.trim();
+    anyhow::ensure!(!id.is_empty(), "Backend id is required");
+    anyhow::ensure!(!host.is_empty(), "Backend host is required");
+    anyhow::ensure!(
+        !id.contains(['\n', '\r']) && !host.contains(['\n', '\r']),
+        "Backend id and host must not contain line breaks"
+    );
+    let ports: BTreeMap<String, u16> = serde_json::from_str(ports)
+        .context("Backend ports must be a JSON object of port numbers")?;
+    anyhow::ensure!(!ports.is_empty(), "At least one backend port is required");
+    anyhow::ensure!(
+        ports
+            .iter()
+            .all(|(transport, port)| !transport.trim().is_empty() && *port != 0),
+        "Backend ports must have non-empty transport names and nonzero port numbers"
+    );
+    let pool_size = parse_setting(pool_size, "pool size")?;
+    anyhow::ensure!(pool_size > 0, "Pool size must be greater than zero");
+    Ok(ecosystem::BackendRegistration {
+        id: id.to_owned(),
+        host: host.to_owned(),
+        ports,
+        pool_size,
+    })
 }
 
 impl SettingsDraft {
@@ -314,6 +356,16 @@ pub struct DesktopApp {
     return_in_progress: bool,
     last_transport_poll: Instant,
     connection_generation: u64,
+    backends_open: bool,
+    backends: Vec<ecosystem::ManagedBackend>,
+    backends_loading: bool,
+    backend_operation: Option<String>,
+    backends_error: Option<String>,
+    backends_last_poll: Instant,
+    backend_id_draft: String,
+    backend_host_draft: String,
+    backend_ports_draft: String,
+    backend_pool_size_draft: String,
     settings_open: bool,
     settings_draft: Option<SettingsDraft>,
     settings_error: Option<String>,
@@ -325,6 +377,7 @@ pub struct DesktopApp {
     method: String,
     methods: Vec<ecosystem::MethodInfo>,
     methods_loading: bool,
+    methods_refresh_pending: bool,
     methods_error: Option<String>,
     params: String,
     parallel_count: usize,
@@ -402,6 +455,16 @@ impl DesktopApp {
             return_in_progress: false,
             last_transport_poll: Instant::now(),
             connection_generation: 0,
+            backends_open: false,
+            backends: Vec::new(),
+            backends_loading: false,
+            backend_operation: None,
+            backends_error: None,
+            backends_last_poll: Instant::now(),
+            backend_id_draft: String::new(),
+            backend_host_draft: String::new(),
+            backend_ports_draft: r#"{"tcp":18081}"#.into(),
+            backend_pool_size_draft: "4".into(),
             settings_open: false,
             settings_draft: None,
             settings_error: None,
@@ -413,6 +476,7 @@ impl DesktopApp {
             method: String::new(),
             methods: Vec::new(),
             methods_loading: false,
+            methods_refresh_pending: false,
             methods_error: None,
             params: "{\n  \"message\": \"Hello, desktop!\"\n}".into(),
             parallel_count: 8,
@@ -502,6 +566,9 @@ impl DesktopApp {
                                 format!("Loading RPC methods failed: {message}"),
                             );
                         }
+                    }
+                    if std::mem::take(&mut self.methods_refresh_pending) {
+                        self.start_method_discovery();
                     }
                 }
                 Event::TransportsLoaded { generation, result } => {
@@ -640,6 +707,54 @@ impl DesktopApp {
                         }
                     }
                 }
+                Event::BackendsLoaded { generation, result } => {
+                    if generation != self.connection_generation {
+                        continue;
+                    }
+                    self.backends_loading = false;
+                    match result {
+                        Ok(backends) => {
+                            self.backends = backends;
+                            self.backends_error = None;
+                        }
+                        Err(error) => {
+                            self.backends_error = Some(format!("{error:#}"));
+                        }
+                    }
+                }
+                Event::BackendOperationFinished {
+                    generation,
+                    label,
+                    result,
+                } => {
+                    if generation != self.connection_generation {
+                        continue;
+                    }
+                    self.backend_operation = None;
+                    match result {
+                        Ok(()) => {
+                            self.log(Level::INFO, format!("Backend operation completed: {label}"));
+                            if label == "Add backend" {
+                                self.backend_id_draft.clear();
+                                self.backend_host_draft.clear();
+                            }
+                            self.start_backends_discovery();
+                            if self.methods_loading {
+                                self.methods_refresh_pending = true;
+                            } else {
+                                self.start_method_discovery();
+                            }
+                        }
+                        Err(error) => {
+                            let message = format!("{error:#}");
+                            self.backends_error = Some(message.clone());
+                            self.log(
+                                Level::ERROR,
+                                format!("Backend operation {label} failed: {message}"),
+                            );
+                        }
+                    }
+                }
                 Event::Connected { generation, result } => {
                     if generation != self.connection_generation {
                         if let Ok((client, _)) = result {
@@ -740,9 +855,12 @@ impl DesktopApp {
         self.method.clear();
         self.methods_error = None;
         self.methods_loading = false;
+        self.methods_refresh_pending = false;
         self.transports_loading = false;
         self.transport_operation = None;
         self.return_in_progress = false;
+        self.backends_loading = false;
+        self.backend_operation = None;
         self.cancel_all();
         self.connection_error = false;
         let previous_client = self.client.take().map(|(client, _)| client);
@@ -827,6 +945,136 @@ impl DesktopApp {
             let _ = tx
                 .send(Event::TransportsLoaded { generation, result })
                 .await;
+        });
+    }
+
+    fn start_backends_discovery(&mut self) {
+        if self.backends_loading || self.backend_operation.is_some() {
+            return;
+        }
+        let Some(connection) = &self.connection else {
+            self.backends_error = Some("Gateway configuration is unavailable".into());
+            return;
+        };
+        let host = connection.host.clone();
+        let port = connection.control_port;
+        let timeout = Duration::from_millis(connection.control_timeout_ms);
+        let transport = ecosystem::CONTROL_PLANE_TRANSPORT.to_owned();
+        let server_name = connection.server_name.clone();
+        let ca_pem = connection.ca_pem.clone();
+        let tx = self.tx.clone();
+        let generation = self.connection_generation;
+        self.backends_loading = true;
+        self.backends_last_poll = Instant::now();
+        self.rt().spawn(async move {
+            let result = ecosystem::fetch_backends_with_transport(
+                &host,
+                port,
+                timeout,
+                ecosystem::ControlTransportOptions {
+                    kind: &transport,
+                    server_name: &server_name,
+                    ca_pem: &ca_pem,
+                },
+            )
+            .await;
+            let _ = tx.send(Event::BackendsLoaded { generation, result }).await;
+        });
+    }
+
+    fn start_backend_operation(
+        &mut self,
+        label: String,
+        future: impl Future<Output = Result<()>> + Send + 'static,
+    ) {
+        if self.backend_operation.is_some() {
+            return;
+        }
+        let tx = self.tx.clone();
+        let generation = self.connection_generation;
+        self.backend_operation = Some(label.clone());
+        self.backends_error = None;
+        self.rt().spawn(async move {
+            let result = future.await;
+            let _ = tx
+                .send(Event::BackendOperationFinished {
+                    generation,
+                    label,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    fn add_backend(&mut self) {
+        let backend = match parse_backend_registration(
+            &self.backend_id_draft,
+            &self.backend_host_draft,
+            &self.backend_ports_draft,
+            &self.backend_pool_size_draft,
+        ) {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.backends_error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        let Some(connection) = &self.connection else {
+            self.backends_error = Some("Gateway configuration is unavailable".into());
+            return;
+        };
+        let host = connection.host.clone();
+        let port = connection.control_port;
+        let timeout = Duration::from_millis(connection.control_timeout_ms);
+        let transport = ecosystem::CONTROL_PLANE_TRANSPORT.to_owned();
+        let server_name = connection.server_name.clone();
+        let ca_pem = connection.ca_pem.clone();
+        self.start_backend_operation("Add backend".into(), async move {
+            ecosystem::add_backend_with_transport(
+                &host,
+                port,
+                timeout,
+                ecosystem::ControlTransportOptions {
+                    kind: &transport,
+                    server_name: &server_name,
+                    ca_pem: &ca_pem,
+                },
+                &backend,
+            )
+            .await
+        });
+    }
+
+    fn set_backend_enabled(&mut self, backend_id: String, enabled: bool) {
+        let Some(connection) = &self.connection else {
+            self.backends_error = Some("Gateway configuration is unavailable".into());
+            return;
+        };
+        let host = connection.host.clone();
+        let port = connection.control_port;
+        let timeout = Duration::from_millis(connection.control_timeout_ms);
+        let transport = ecosystem::CONTROL_PLANE_TRANSPORT.to_owned();
+        let server_name = connection.server_name.clone();
+        let ca_pem = connection.ca_pem.clone();
+        let label = if enabled {
+            format!("Enable backend {backend_id}")
+        } else {
+            format!("Disable backend {backend_id}")
+        };
+        self.start_backend_operation(label, async move {
+            ecosystem::set_backend_enabled_with_transport(
+                &host,
+                port,
+                timeout,
+                ecosystem::ControlTransportOptions {
+                    kind: &transport,
+                    server_name: &server_name,
+                    ca_pem: &ca_pem,
+                },
+                &backend_id,
+                enabled,
+            )
+            .await
         });
     }
 
@@ -1199,6 +1447,14 @@ impl DesktopApp {
         } else if !self.methods_loading && self.methods.is_empty() {
             ui.label("The Control Plane reported no implemented methods.");
         }
+        if let Some(warning) = self
+            .methods
+            .iter()
+            .find(|method| method.name == self.method)
+            .and_then(|method| method.metadata_warning.as_deref())
+        {
+            ui.colored_label(Color32::YELLOW, warning);
+        }
         if let Some(schema) = self
             .methods
             .iter()
@@ -1487,6 +1743,149 @@ impl DesktopApp {
             .collect::<Vec<_>>()
             .join("\n")
     }
+
+    fn show_backends_window(&mut self, ctx: &egui::Context) {
+        if !self.backends_open {
+            return;
+        }
+        let mut refresh = false;
+        let mut add = false;
+        let mut toggle = None;
+        egui::Window::new("Backends")
+            .open(&mut self.backends_open)
+            .default_width(760.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Gateway backends");
+                    if self.backends_loading {
+                        ui.spinner();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.connection.is_some()
+                                && !self.backends_loading
+                                && self.backend_operation.is_none(),
+                            egui::Button::new("Refresh"),
+                        )
+                        .clicked()
+                    {
+                        refresh = true;
+                    }
+                });
+                ui.small("Registration does not launch a backend process. Disabling one stops new routing and lets in-flight requests finish; it does not stop the process.");
+                ui.separator();
+
+                ui.heading("Register backend");
+                egui::Grid::new("backend-registration-grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("ID");
+                        ui.text_edit_singleline(&mut self.backend_id_draft);
+                        ui.end_row();
+                        ui.label("Host / IP");
+                        ui.text_edit_singleline(&mut self.backend_host_draft);
+                        ui.end_row();
+                        ui.label("Ports (JSON)");
+                        ui.text_edit_singleline(&mut self.backend_ports_draft);
+                        ui.end_row();
+                        ui.label("Pool size");
+                        ui.text_edit_singleline(&mut self.backend_pool_size_draft);
+                        ui.end_row();
+                    });
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.connection.is_some() && self.backend_operation.is_none(),
+                            egui::Button::new("Add backend"),
+                        )
+                        .clicked()
+                    {
+                        add = true;
+                    }
+                });
+                ui.small(r#"Ports must be a JSON object, for example {"tcp":18081}."#);
+                ui.separator();
+
+                ui.heading(format!("Registered backends ({})", self.backends.len()));
+                if self.backends.is_empty() && !self.backends_loading {
+                    ui.label("No backends reported by the Control Plane.");
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        for backend in &self.backends {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.strong(&backend.id);
+                                    ui.label(&backend.host);
+                                    ui.label(
+                                        RichText::new(if backend.enabled {
+                                            "enabled"
+                                        } else {
+                                            "disabled"
+                                        })
+                                        .color(if backend.enabled {
+                                            ACCENT
+                                        } else {
+                                            Color32::LIGHT_RED
+                                        }),
+                                    );
+                                    if ui
+                                        .add_enabled(
+                                            self.connection.is_some()
+                                                && self.backend_operation.is_none(),
+                                            egui::Button::new(if backend.enabled {
+                                                "Disable"
+                                            } else {
+                                                "Enable"
+                                            }),
+                                        )
+                                        .clicked()
+                                    {
+                                        toggle = Some((backend.id.clone(), !backend.enabled));
+                                    }
+                                });
+                                let ports = backend
+                                    .ports
+                                    .iter()
+                                    .map(|(transport, port)| format!("{transport}: {port}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                ui.label(format!("Ports: {ports}"));
+                                if let Some(pool_size) = backend.pool_size {
+                                    ui.label(format!("Pool size: {pool_size}"));
+                                }
+                                ui.label(format!("Active requests: {}", backend.active_requests));
+                                if let Some(pools) = &backend.pools {
+                                    ui.label(format!("Pools: {pools}"));
+                                } else {
+                                    ui.label("Pool state: not reported");
+                                }
+                            });
+                        }
+                    });
+                if let Some(operation) = &self.backend_operation {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(operation);
+                    });
+                }
+                if let Some(error) = &self.backends_error {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                }
+            });
+        if refresh {
+            self.start_backends_discovery();
+        }
+        if add {
+            self.add_backend();
+        }
+        if let Some((id, enabled)) = toggle {
+            self.set_backend_enabled(id, enabled);
+        }
+    }
 }
 
 impl eframe::App for DesktopApp {
@@ -1505,6 +1904,13 @@ impl eframe::App for DesktopApp {
         {
             self.start_transport_discovery();
         }
+        if self.backends_open
+            && !self.backends_loading
+            && self.backend_operation.is_none()
+            && self.backends_last_poll.elapsed() >= Duration::from_secs(5)
+        {
+            self.start_backends_discovery();
+        }
         if self.client.is_some()
             && let Some(result) = self.map.poll(
                 self.runtime
@@ -1519,6 +1925,7 @@ impl eframe::App for DesktopApp {
         }
         ctx.request_repaint_after(Duration::from_millis(150));
         let mut open_settings = false;
+        let mut open_backends = false;
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(RichText::new("JSON-RPC-2").color(ACCENT));
@@ -1540,6 +1947,9 @@ impl eframe::App for DesktopApp {
                     ui.label("No open session");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Backends").clicked() {
+                        open_backends = true;
+                    }
                     ui.menu_button("Settings", |ui| {
                         if ui.button("Application settings…").clicked() {
                             open_settings = true;
@@ -1552,6 +1962,11 @@ impl eframe::App for DesktopApp {
         if open_settings {
             self.open_settings();
         }
+        if open_backends {
+            self.backends_open = true;
+            self.start_backends_discovery();
+        }
+        self.show_backends_window(ctx);
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
@@ -1742,5 +2157,26 @@ impl Drop for DesktopApp {
             });
             runtime.shutdown_timeout(Duration::from_secs(2));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_backend_registration_form() {
+        let registration =
+            parse_backend_registration(" backend-133 ", " 192.168.1.133 ", r#"{"tcp":18081}"#, "4")
+                .unwrap();
+        assert_eq!(registration.id, "backend-133");
+        assert_eq!(registration.host, "192.168.1.133");
+        assert_eq!(registration.ports["tcp"], 18081);
+        assert_eq!(registration.pool_size, 4);
+
+        assert!(parse_backend_registration("", "192.168.1.133", r#"{"tcp":18081}"#, "4").is_err());
+        assert!(parse_backend_registration("backend", "", r#"{"tcp":18081}"#, "4").is_err());
+        assert!(parse_backend_registration("backend", "host", r#"{"tcp":0}"#, "4").is_err());
+        assert!(parse_backend_registration("backend", "host", r#"{"tcp":18081}"#, "0").is_err());
     }
 }

@@ -54,12 +54,23 @@ Build Tools. Інтеграційні перевірки в цьому сере�
 | Parallel calls | Клонування клієнта зі спільною сесією та ID; 1–64 конкурентних запити, окремий результат/помилка кожного |
 | Policy & liveness | Автоматичний ping за `GATEWAY_PING_INTERVAL_MS`; поріг missed pong і кількість повторів restore задаються в `.env` та змінюються в Runtime policy; після вичерпання restore виконується Gateway fallback reconnect |
 | Transport controls | Транспортний ping/pong без RPC, restore, reconnect із повтором gateway fallback; панель Connection читає `list_transports` і надсилає `set_transport_enabled` для профілів QUIC/TLS/TCP |
+| Backends | `list_backends`, реєстрація backend через `add_backend`, увімкнення/вимкнення маршрутизації через `set_backend_enabled`; список автоматично оновлюється |
 | Running operations | Скасування конкретної операції або всіх, включно з паралельними дочірніми запитами |
 | Metrics | Справжній `ClientMetricsSnapshot`: активні запити, черга, RPC calls/errors, timeouts, cancellations, recovery attempts, missed pongs; застосована конфігурація |
 | Event log | Події `tracing` бібліотеки, liveness/recovery, фільтр, рівні, копіювання; опційний DEBUG/TRACE |
 | Мапа | Граф Gateway → in-process Balancer → backend-и; ingress endpoints, circuit breakers та зайнятість connection pools через Control Plane |
 
 ### Мапа екосистеми Gateway
+
+Каталог методів допускає відсутній або `null` приклад запиту. Такий метод
+залишається доступним для ручного введення параметрів. Некоректний приклад чи
+форма схеми показуються попередженням біля вибраного методу, не блокуючи інші
+методи. Помилки структури каталогу (зокрема дублікати назв) залишаються помилками.
+
+The method catalog accepts missing or `null` request examples, leaving those
+methods available for manual parameter entry. Malformed examples or schema
+shapes produce a warning for the selected method without blocking other methods.
+Structural catalog errors, including duplicate method names, remain errors.
 
 Вкладка **Мапа** автоматично опитує Control Plane gateway-а за портом
 `GATEWAY_CONTROL_PORT`. Це окремий канал до того самого gateway, незалежний
@@ -94,6 +105,14 @@ Build Tools. Інтеграційні перевірки в цьому сере�
 поки попередня сесія обслуговує запити; стара закривається лише після успіху.
 Невдалі спроби зберігають поточну сесію й повторюються через той самий інтервал.
 Під час fallback вимкнені профілі пропускаються.
+
+Пункт **Backends** у верхньому меню відкриває список backend-ів із ID, host/IP,
+портами, enabled, active requests і станом пулів. Форма реєстрації приймає ID,
+host, JSON-об'єкт портів (наприклад `{"tcp":18081}`) та pool size. Реєстрація
+оновлює конфігурацію балансування, але не запускає backend-процес. **Disable**
+припиняє маршрутизацію нових запитів до backend-а; це не зупиняє сам процес.
+Його поточні запити та сесії завершуються за правилами Control Plane. Список
+оновлюється кожні п'ять секунд, поки вікно відкрите.
 
 Це **неатомарний знімок конфігурації та локального стану пулів**, не активна
 перевірка здоров'я. Closed circuit або наявний connection не доводить, що
@@ -212,8 +231,13 @@ SRT/IoT/kernel-specific з'єднання потребують окремого 
 
 ### Важливі upstream-деталі
 
-- JSON-RPC-2 зафіксована на `0a5cee9c7cd5e2e1ecb4c123c3f99bceeaf6044f`.
-  Її workspace patches не успадковуються downstream-проєктами, тому
+- JSON-RPC-2 зафіксована на `1d519f47d5cc44d1986fd09c738a9b4609536e07`.
+  Оновлена бібліотека додає `rpc.list_methods` з описами JSON Schema,
+  aliases і `ServerPlugin`, а також окремі `json-rpc-2-backend` та
+  `json-rpc-2-gateway` crates. Desktop-клієнт використовує оновлені клієнтські
+  API та Control Plane; серверні crates не додаються до застосунку, оскільки
+  він не збирає backend-плагіни.
+  Workspace patches не успадковуються downstream-проєктами, тому
   `Cargo.toml` явно фіксує ті ж `h3`/`h3-quinn` git patches для extended CONNECT.
 - У цій ревізії WS/QUIC та WS/HTTP3 під час reconnect ділять QUIC endpoint між
   старою і новою сесіями, тоді як close очікує endpoint-wide idleness.

@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
@@ -12,6 +12,7 @@ use tokio::net;
 pub const LIST_COMPONENTS: &[u8] = b"{\"action\":\"list_components\"}\n";
 pub const LIST_METHODS: &[u8] = b"{\"action\":\"list_methods\"}\n";
 pub const LIST_TRANSPORTS: &[u8] = b"{\"action\":\"list_transports\"}\n";
+pub const LIST_BACKENDS: &[u8] = b"{\"action\":\"list_backends\"}\n";
 pub const CONTROL_PLANE_TRANSPORT: &str = "tcp";
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -19,6 +20,27 @@ const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 pub struct TransportStatus {
     pub transport: String,
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BackendRegistration {
+    pub id: String,
+    pub host: String,
+    pub ports: BTreeMap<String, u16>,
+    pub pool_size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct ManagedBackend {
+    pub id: String,
+    pub host: String,
+    pub ports: BTreeMap<String, u16>,
+    pub enabled: bool,
+    pub active_requests: usize,
+    #[serde(default)]
+    pub pool_size: Option<usize>,
+    #[serde(default)]
+    pub pools: Option<serde_json::Value>,
 }
 
 pub struct ControlTransportOptions<'a> {
@@ -209,10 +231,53 @@ struct MethodsResponse {
 }
 
 #[derive(Deserialize)]
+struct BackendsResponse {
+    success: bool,
+    error: Option<String>,
+    backends: Option<Vec<ManagedBackend>>,
+}
+
+pub fn parse_backends_response(bytes: &[u8]) -> Result<Vec<ManagedBackend>> {
+    let response: BackendsResponse =
+        serde_json::from_slice(bytes).context("Invalid list_backends response")?;
+    if !response.success {
+        bail!(
+            "Control Plane rejected list_backends: {}",
+            response.error.as_deref().unwrap_or("unspecified error")
+        );
+    }
+    let backends = response
+        .backends
+        .context("Successful list_backends response is missing backends")?;
+    let mut ids = std::collections::HashSet::new();
+    for backend in &backends {
+        ensure!(
+            !backend.id.trim().is_empty() && ids.insert(backend.id.clone()),
+            "list_backends response contains an empty or duplicate backend id"
+        );
+        ensure!(
+            !backend.host.trim().is_empty(),
+            "Backend {} has an empty host",
+            backend.id
+        );
+        ensure!(
+            !backend.ports.is_empty()
+                && backend
+                    .ports
+                    .iter()
+                    .all(|(transport, port)| !transport.trim().is_empty() && *port != 0),
+            "Backend {} has invalid ports",
+            backend.id
+        );
+    }
+    Ok(backends)
+}
+
+#[derive(Deserialize)]
 struct MethodDetailResponse {
     name: String,
     params_schema: Option<serde_json::Value>,
-    example_request: serde_json::Value,
+    example_request: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +285,7 @@ pub struct MethodInfo {
     pub name: String,
     pub params_schema: Option<serde_json::Value>,
     pub example_params: String,
+    pub metadata_warning: Option<String>,
 }
 
 pub fn parse_methods_response(bytes: &[u8]) -> Result<Vec<MethodInfo>> {
@@ -261,39 +327,38 @@ pub fn parse_methods_response(bytes: &[u8]) -> Result<Vec<MethodInfo>> {
             "Method details contain duplicate method {}",
             detail.name
         );
-        let request = detail
-            .example_request
-            .as_object()
-            .context("Method example_request must be a JSON object")?;
-        ensure!(
-            request.get("jsonrpc").and_then(serde_json::Value::as_str) == Some("2.0"),
-            "Method {} example_request must specify JSON-RPC 2.0",
-            detail.name
-        );
-        ensure!(
-            request.get("method").and_then(serde_json::Value::as_str) == Some(detail.name.as_str()),
-            "Method {} example_request has a mismatched method name",
-            detail.name
-        );
-        if let Some(params) = request.get("params") {
-            ensure!(
-                params.is_object() || params.is_array(),
-                "Method {} example params must be an object or array",
-                detail.name
-            );
-        }
-        let example_params = request
-            .get("params")
-            .map(serde_json::to_string_pretty)
-            .transpose()
-            .context("Serializing method example params")?
-            .unwrap_or_default();
+        let mut warnings = Vec::new();
+        let example_params = match detail.example_request.as_ref() {
+            None => {
+                warnings.push("No request example supplied; enter parameters manually.".to_owned());
+                String::new()
+            }
+            Some(request) => match parse_method_example(&detail.name, request) {
+                Ok(params) => params,
+                Err(error) => {
+                    warnings.push(format!(
+                        "Invalid request example: {error}. Enter parameters manually."
+                    ));
+                    String::new()
+                }
+            },
+        };
+        let params_schema = match detail.params_schema {
+            Some(schema) if schema.is_object() || schema.is_boolean() => Some(schema),
+            Some(_) => {
+                warnings
+                    .push("Invalid parameter schema: expected an object or boolean.".to_owned());
+                None
+            }
+            None => None,
+        };
         details_by_name.insert(
             detail.name.clone(),
             MethodInfo {
                 name: detail.name,
-                params_schema: detail.params_schema,
+                params_schema,
                 example_params,
+                metadata_warning: (!warnings.is_empty()).then(|| warnings.join(" ")),
             },
         );
     }
@@ -309,6 +374,32 @@ pub fn parse_methods_response(bytes: &[u8]) -> Result<Vec<MethodInfo>> {
                 .with_context(|| format!("Missing details for listed method {name}"))
         })
         .collect()
+}
+
+fn parse_method_example(name: &str, example: &serde_json::Value) -> Result<String> {
+    let request = example
+        .as_object()
+        .context("example_request must be a JSON object")?;
+    ensure!(
+        request.get("jsonrpc").and_then(serde_json::Value::as_str) == Some("2.0"),
+        "example_request must specify JSON-RPC 2.0"
+    );
+    ensure!(
+        request.get("method").and_then(serde_json::Value::as_str) == Some(name),
+        "example_request has a mismatched method name"
+    );
+    if let Some(params) = request.get("params") {
+        ensure!(
+            params.is_object() || params.is_array(),
+            "example params must be an object or array"
+        );
+    }
+    request
+        .get("params")
+        .map(serde_json::to_string_pretty)
+        .transpose()
+        .context("Serializing method example params")
+        .map(Option::unwrap_or_default)
 }
 
 pub struct ControlSession {
@@ -405,6 +496,32 @@ impl ControlSession {
         parse_transport_statuses(&bytes)
     }
 
+    pub async fn list_backends(&mut self) -> Result<Vec<ManagedBackend>> {
+        let bytes = self.request_bytes(LIST_BACKENDS, "list_backends").await?;
+        parse_backends_response(&bytes)
+    }
+
+    pub async fn add_backend(&mut self, backend: &BackendRegistration) -> Result<()> {
+        let command = serde_json::to_vec(&serde_json::json!({
+            "action": "add_backend",
+            "backend": backend,
+        }))
+        .context("Serializing add_backend command")?;
+        let response = self.request_bytes(&command, "add_backend").await?;
+        parse_action_response(&response, "add_backend")
+    }
+
+    pub async fn set_backend_enabled(&mut self, backend_id: &str, enabled: bool) -> Result<()> {
+        let command = serde_json::to_vec(&serde_json::json!({
+            "action": "set_backend_enabled",
+            "backend_id": backend_id,
+            "enabled": enabled,
+        }))
+        .context("Serializing set_backend_enabled command")?;
+        let response = self.request_bytes(&command, "set_backend_enabled").await?;
+        parse_action_response(&response, "set_backend_enabled")
+    }
+
     pub async fn set_transport_enabled(&mut self, transport: &str, enabled: bool) -> Result<()> {
         ensure!(
             !transport.trim().is_empty() && !transport.contains(['\n', '\r', '"']),
@@ -496,6 +613,75 @@ pub async fn fetch_transports_with_transport(
     })
     .await
     .context("Control Plane list_transports request timed out")?
+}
+
+pub async fn fetch_backends_with_transport(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    connection_transport: ControlTransportOptions<'_>,
+) -> Result<Vec<ManagedBackend>> {
+    ensure!(!timeout.is_zero(), "Control Plane timeout must be positive");
+    tokio::time::timeout(timeout, async {
+        let mut session = ControlSession::connect_with_transport(
+            host,
+            port,
+            connection_transport.kind,
+            connection_transport.server_name,
+            connection_transport.ca_pem,
+        )
+        .await?;
+        session.list_backends().await
+    })
+    .await
+    .context("Control Plane list_backends request timed out")?
+}
+
+pub async fn add_backend_with_transport(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    connection_transport: ControlTransportOptions<'_>,
+    backend: &BackendRegistration,
+) -> Result<()> {
+    ensure!(!timeout.is_zero(), "Control Plane timeout must be positive");
+    tokio::time::timeout(timeout, async {
+        let mut session = ControlSession::connect_with_transport(
+            host,
+            port,
+            connection_transport.kind,
+            connection_transport.server_name,
+            connection_transport.ca_pem,
+        )
+        .await?;
+        session.add_backend(backend).await
+    })
+    .await
+    .context("Control Plane add_backend request timed out")?
+}
+
+pub async fn set_backend_enabled_with_transport(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    connection_transport: ControlTransportOptions<'_>,
+    backend_id: &str,
+    enabled: bool,
+) -> Result<()> {
+    ensure!(!timeout.is_zero(), "Control Plane timeout must be positive");
+    tokio::time::timeout(timeout, async {
+        let mut session = ControlSession::connect_with_transport(
+            host,
+            port,
+            connection_transport.kind,
+            connection_transport.server_name,
+            connection_transport.ca_pem,
+        )
+        .await?;
+        session.set_backend_enabled(backend_id, enabled).await
+    })
+    .await
+    .context("Control Plane set_backend_enabled request timed out")?
 }
 
 pub async fn set_transport_enabled(
@@ -637,6 +823,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_backend_inventory_and_rejects_invalid_entries() {
+        let backends = parse_backends_response(
+            br#"{"success":true,"backends":[{"id":"backend-133","host":"192.168.1.133","ports":{"tcp":18081},"pool_size":4,"enabled":false,"active_requests":2,"pools":{"tcp":{"busy":2}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].id, "backend-133");
+        assert_eq!(backends[0].ports["tcp"], 18081);
+        assert_eq!(backends[0].pool_size, Some(4));
+        assert_eq!(backends[0].active_requests, 2);
+        assert_eq!(backends[0].pools.as_ref().unwrap()["tcp"]["busy"], 2);
+        assert!(
+            parse_backends_response(br#"{"success":true,"backends":[]}"#)
+                .unwrap()
+                .is_empty()
+        );
+        for invalid in [
+            br#"{"success":false,"error":"denied"}"#.as_slice(),
+            br#"{"success":true}"#,
+            br#"{"success":true,"backends":[{"id":"","host":"localhost","ports":{"tcp":80},"enabled":true}]}"#,
+            br#"{"success":true,"backends":[{"id":"a","host":"localhost","ports":{"tcp":0},"enabled":true}]}"#,
+            br#"{"success":true,"backends":[{"id":"a","host":"localhost","ports":{"tcp":80},"enabled":true}]}"#,
+        ] {
+            assert!(parse_backends_response(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn parses_method_examples_and_preserves_catalog_order() {
         let catalog = json!({
             "success": true,
@@ -707,10 +921,74 @@ mod tests {
             parse_methods_response(br#"{"success":true,"methods":["echo"],"method_details":[]}"#)
                 .is_err()
         );
-        assert!(parse_methods_response(
-            br#"{"success":true,"methods":["echo"],"method_details":[{"name":"echo","example_request":{"jsonrpc":"2.0","method":"wrong","params":{}}}]}"#
-        )
-        .is_err());
+    }
+
+    #[test]
+    fn optional_and_invalid_examples_do_not_reject_other_methods() {
+        for example in [
+            json!(null),
+            json!(42),
+            json!([]),
+            json!({"jsonrpc":"1.0","method":"optional"}),
+            json!({"jsonrpc":"2.0","method":"wrong","params":{}}),
+            json!({"jsonrpc":"2.0","method":"optional","params":null}),
+        ] {
+            let catalog = json!({
+                "success":true, "methods":["echo","optional","missing"],
+                "method_details":[
+                    {"name":"echo","example_request":{"jsonrpc":"2.0","method":"echo","params":{"message":"hello"}}},
+                    {"name":"optional","params_schema":null,"example_request":example},
+                    {"name":"missing"}
+                ]
+            });
+            let methods = parse_methods_response(&serde_json::to_vec(&catalog).unwrap()).unwrap();
+            assert_eq!(methods.len(), 3);
+            assert!(methods[0].metadata_warning.is_none());
+            assert!(methods[0].example_params.contains("hello"));
+            for method in &methods[1..] {
+                assert!(method.example_params.is_empty());
+                assert!(method.metadata_warning.is_some());
+            }
+        }
+        let methods = parse_methods_response(br#"{"success":true,"methods":["info"],"method_details":[{"name":"info","example_request":{"jsonrpc":"2.0","method":"info"},"params_schema":42}]}"#).unwrap();
+        assert!(methods[0].example_params.is_empty());
+        assert!(
+            methods[0]
+                .metadata_warning
+                .as_ref()
+                .unwrap()
+                .contains("schema")
+        );
+        assert!(methods[0].params_schema.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_GATEWAY_HOST and TEST_CONTROL_PORT pointing to deployed backends"]
+    async fn live_discovery_has_complete_metadata() -> Result<()> {
+        let host = std::env::var("TEST_GATEWAY_HOST")?;
+        let port = std::env::var("TEST_CONTROL_PORT")?.parse()?;
+        let methods = fetch_methods(&host, port, Duration::from_secs(15)).await?;
+        ensure!(!methods.is_empty(), "Empty live method catalog");
+        for method in methods {
+            ensure!(
+                method.metadata_warning.is_none(),
+                "{}: {:?}",
+                method.name,
+                method.metadata_warning
+            );
+            ensure!(
+                method.params_schema.is_some(),
+                "{}: missing schema",
+                method.name
+            );
+            let params: serde_json::Value = serde_json::from_str(&method.example_params)?;
+            ensure!(
+                params.is_object() || params.is_array(),
+                "{}: invalid params",
+                method.name
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -844,6 +1122,71 @@ mod tests {
                 enabled: true
             }]
         );
+        server.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sends_backend_inventory_and_management_commands() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let mut command = Vec::new();
+            reader.read_until(b'\n', &mut command).await.unwrap();
+            assert_eq!(command, LIST_BACKENDS);
+            reader
+                .get_mut()
+                .write_all(
+                    br#"{"success":true,"backends":[{"id":"backend-133","host":"192.168.1.133","ports":{"tcp":18081},"pool_size":4,"enabled":true,"active_requests":0}]}"#,
+                )
+                .await
+                .unwrap();
+            reader.get_mut().write_all(b"\n").await.unwrap();
+
+            command.clear();
+            reader.read_until(b'\n', &mut command).await.unwrap();
+            let add: serde_json::Value = serde_json::from_slice(&command).unwrap();
+            assert_eq!(add["action"], "add_backend");
+            assert_eq!(add["backend"]["id"], "backend-134");
+            assert_eq!(add["backend"]["host"], "192.168.1.134");
+            assert_eq!(add["backend"]["ports"]["tcp"], 18082);
+            assert_eq!(add["backend"]["pool_size"], 4);
+            reader
+                .get_mut()
+                .write_all(br#"{"success":true}"#)
+                .await
+                .unwrap();
+            reader.get_mut().write_all(b"\n").await.unwrap();
+
+            command.clear();
+            reader.read_until(b'\n', &mut command).await.unwrap();
+            let enabled: serde_json::Value = serde_json::from_slice(&command).unwrap();
+            assert_eq!(enabled["action"], "set_backend_enabled");
+            assert_eq!(enabled["backend_id"], "backend-133");
+            assert_eq!(enabled["enabled"], false);
+            reader
+                .get_mut()
+                .write_all(br#"{"success":true}"#)
+                .await
+                .unwrap();
+            reader.get_mut().write_all(b"\n").await.unwrap();
+        });
+
+        let mut session = ControlSession::connect("127.0.0.1", port).await?;
+        let listed = session.list_backends().await?;
+        assert_eq!(listed[0].id, "backend-133");
+        session
+            .add_backend(&BackendRegistration {
+                id: "backend-134".into(),
+                host: "192.168.1.134".into(),
+                ports: BTreeMap::from([("tcp".into(), 18082)]),
+                pool_size: 4,
+            })
+            .await?;
+        session.set_backend_enabled("backend-133", false).await?;
         server.await?;
         Ok(())
     }
