@@ -21,9 +21,11 @@ cargo run --locked --release
 
 Апка читає конфігурацію шлюзу з `.env` (або змінних середовища процесу) і
 підключається під час запуску. Задайте `GATEWAY_HOST`,
-`GATEWAY_PORT` (один ingress-порт для QUIC, TLS і TCP), `GATEWAY_TLS_SERVER_NAME`,
-`GATEWAY_CA_FILE` (довірений CA PEM) і
-`GATEWAY_CONTROL_PORT`. Тайм-аути підключення та повторів теж задаються в
+`GATEWAY_PORT` (один ingress-порт для QUIC, TLS і TCP),
+`GATEWAY_CONTROL_HOST` (приватна IPv4-адреса Control Plane, типово
+`192.168.1.132`), `GATEWAY_TLS_SERVER_NAME`, `GATEWAY_CA_FILE` (довірений CA PEM) і
+`GATEWAY_CONTROL_PORT`. HTTP-служба використовує ту саму приватну адресу та
+`GATEWAY_HTTP_SERVICE_PORT` (типово `8508`). Тайм-аути підключення та повторів теж задаються в
 `.env.example`. `GATEWAY_PING_INTERVAL_MS` задає періодичність ping;
 `GATEWAY_MISSED_PONGS` і `GATEWAY_RECOVERY_ATTEMPTS` задають поріг пропущених
 pong та кількість спроб відновити поточний транспорт перед повним перепідключенням.
@@ -31,7 +33,8 @@ pong та кількість спроб відновити поточний тр
 повернутися на бажаний транспорт (типово 30 секунд).
 RPC-підключення тричі пробує QUIC, потім тричі TLS і тричі TCP.
 Усі RPC-вкладки використовують одну сесію; окремий канал Control Plane
-підключається тим самим транспортом, що й активна Gateway-сесія.
+підключається до `GATEWAY_CONTROL_HOST:GATEWAY_CONTROL_PORT` через TCP, окремо
+від зовнішнього Gateway host. Допускаються лише приватні або loopback IPv4-адреси.
 Якщо `.env` або обов’язкові значення відсутні чи некоректні, апка відкриється
 з повідомленням про помилку конфігурації замість аварійного завершення;
 після виправлення `.env` перезапустіть її.
@@ -50,6 +53,7 @@ Build Tools. Інтеграційні перевірки в цьому сере�
 | --- | --- |
 | Gateway connection | Автоматичне підключення зі значень `.env`; QUIC → TLS → TCP, по три спроби на транспорт; спільна RPC-сесія для всіх вкладок |
 | Request | `list_methods` із Control Plane; вибір лише оголошених backend-методів і підстановка кожного зразка `method_details.example_request.params`, перегляд `params_schema`, структуровані object/array params, відсутні params, `notify`, типізоване `request<P, R>` із serde та `request_without_params<R>` |
+| HTTP service | GET/POST/PUT/DELETE до `http://GATEWAY_CONTROL_HOST:GATEWAY_HTTP_SERVICE_PORT`, відносний endpoint, необов'язкове JSON тіло, перегляд статусу/заголовків/тіла відповіді |
 | Batch | Змішані виклики/сповіщення, автоматичні ID, кореляція результатів у порядку вхідних викликів, окремі remote errors; notification-only batch |
 | Parallel calls | Клонування клієнта зі спільною сесією та ID; 1–64 конкурентних запити, окремий результат/помилка кожного |
 | Policy & liveness | Автоматичний ping за `GATEWAY_PING_INTERVAL_MS`; поріг missed pong і кількість повторів restore задаються в `.env` та змінюються в Runtime policy; після вичерпання restore виконується Gateway fallback reconnect |
@@ -66,6 +70,17 @@ Build Tools. Інтеграційні перевірки в цьому сере�
 залишається доступним для ручного введення параметрів. Некоректний приклад чи
 форма схеми показуються попередженням біля вибраного методу, не блокуючи інші
 методи. Помилки структури каталогу (зокрема дублікати назв) залишаються помилками.
+
+Усі запити Control Plane (каталог методів, стани транспортів, backend-и та мапа)
+використовують окрему приватну адресу `GATEWAY_CONTROL_HOST`, а не `GATEWAY_HOST`.
+Значення за замовчуванням — `192.168.1.132`; його також можна змінити в UI Settings.
+
+All Control Plane requests (method catalog, transport status, backends, and map)
+use the separate private `GATEWAY_CONTROL_HOST` address instead of `GATEWAY_HOST`.
+The default is `192.168.1.132`, and it can also be changed in UI Settings.
+The new HTTP service is mapped at `http://GATEWAY_CONTROL_HOST:GATEWAY_HTTP_SERVICE_PORT`;
+the port defaults to `8508`. The HTTP service tab supports GET, POST, PUT, and
+DELETE with a relative endpoint and an optional JSON body.
 
 The method catalog accepts missing or `null` request examples, leaving those
 methods available for manual parameter entry. Malformed examples or schema

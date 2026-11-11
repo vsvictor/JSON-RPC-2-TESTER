@@ -15,6 +15,7 @@ const HALF_OPEN: Color32 = Color32::from_rgb(245, 192, 90);
 pub struct EcosystemMap {
     host: String,
     port: u16,
+    http_service_port: u16,
     timeout_ms: u64,
     transport: String,
     server_name: String,
@@ -36,6 +37,7 @@ impl Default for EcosystemMap {
         Self {
             host: "127.0.0.1".into(),
             port: 8500,
+            http_service_port: 8508,
             timeout_ms: 5000,
             transport: "tcp".into(),
             server_name: String::new(),
@@ -79,6 +81,10 @@ impl EcosystemMap {
         map.monitoring = true;
         map.fetched_from = fetched_from;
         map
+    }
+
+    pub fn set_http_service_port(&mut self, port: u16) {
+        self.http_service_port = port;
     }
 
     #[cfg(test)]
@@ -253,7 +259,7 @@ impl EcosystemMap {
                 "backend_count відрізняється від кількості записів у знімку.",
             );
         }
-        draw_inventory(ui, inventory, self.zoom);
+        draw_inventory(ui, inventory, self.zoom, &self.host, self.http_service_port);
     }
 }
 
@@ -317,7 +323,13 @@ struct Card {
     lines: Vec<(String, Color32)>,
 }
 
-fn draw_inventory(ui: &mut egui::Ui, inventory: &Components, zoom: f32) {
+fn draw_inventory(
+    ui: &mut egui::Ui,
+    inventory: &Components,
+    zoom: f32,
+    service_host: &str,
+    service_port: u16,
+) {
     let text_color = Color32::LIGHT_GRAY;
     let gateway = &inventory.gateway;
     let mut gateway_lines = vec![
@@ -356,6 +368,13 @@ fn draw_inventory(ui: &mut egui::Ui, inventory: &Components, zoom: f32) {
             ),
         ],
     };
+    let service_card = Card {
+        title: "HTTP Service".into(),
+        lines: vec![
+            (format!("http://{service_host}:{service_port}"), text_color),
+            ("GET / POST / PUT / DELETE".into(), CLOSED),
+        ],
+    };
     let backends: Vec<Card> = inventory
         .backends
         .iter()
@@ -391,7 +410,12 @@ fn draw_inventory(ui: &mut egui::Ui, inventory: &Components, zoom: f32) {
         .collect();
     let card_height = |card: &Card| 52.0 + card.lines.len() as f32 * 21.0;
     let backend_total: f32 = backends.iter().map(|card| card_height(card) + 24.0).sum();
-    let height = backend_total.max(card_height(&gateway_card)).max(280.0) + 48.0;
+    let service_total = backend_total + card_height(&service_card) + 24.0;
+    let height = service_total
+        .max(card_height(&gateway_card))
+        .max(card_height(&balancer_card))
+        .max(280.0)
+        + 48.0;
     let width = 1480.0;
     egui::ScrollArea::both()
         .id_salt("ecosystem_canvas")
@@ -410,6 +434,7 @@ fn draw_inventory(ui: &mut egui::Ui, inventory: &Components, zoom: f32) {
                 backend_rects.push(rect(936.0, y, 528.0, card_height(card)));
                 y += card_height(card) + 24.0;
             }
+            let service_rect = rect(936.0, y, 528.0, card_height(&service_card));
             let painter = ui.painter();
             let connect = |from: Pos2, to: Pos2, color: Color32| {
                 let mid = (from.x + to.x) / 2.0;
@@ -438,8 +463,14 @@ fn draw_inventory(ui: &mut egui::Ui, inventory: &Components, zoom: f32) {
                     Color32::GRAY,
                 );
             }
+            connect(
+                gateway_rect.right_center(),
+                service_rect.left_center(),
+                CLOSED,
+            );
             draw_card(ui, gateway_rect, &gateway_card, zoom, "gateway");
             draw_card(ui, balancer_rect, &balancer_card, zoom, "balancer");
+            draw_card(ui, service_rect, &service_card, zoom, "http-service");
             for (index, (card, rect)) in backends.iter().zip(backend_rects).enumerate() {
                 draw_card(ui, rect, card, zoom, ("backend", index));
             }

@@ -2,7 +2,7 @@ use std::{
     env,
     future::Future,
     io::ErrorKind,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     path::Path,
     str::FromStr,
     sync::{
@@ -34,6 +34,7 @@ const ATTEMPTS_PER_TRANSPORT: usize = 3;
 pub struct GatewaySettings {
     pub host: String,
     pub port: u16,
+    pub control_host: String,
     pub server_name: String,
     pub ca_file: String,
     pub ca_pem: String,
@@ -41,6 +42,7 @@ pub struct GatewaySettings {
     pub retry_delay_ms: u64,
     pub control_port: u16,
     pub control_timeout_ms: u64,
+    pub http_service_port: u16,
     pub recovery_attempts: Arc<AtomicU32>,
     pub transport_policy: Arc<AtomicU8>,
     pub gateway_up_return_sec: u64,
@@ -85,6 +87,7 @@ impl GatewaySettings {
         let settings = Self {
             host: required_env("GATEWAY_HOST")?,
             port: required_env("GATEWAY_PORT")?,
+            control_host: env_or("GATEWAY_CONTROL_HOST", "192.168.1.132".to_owned())?,
             server_name: required_env("GATEWAY_TLS_SERVER_NAME")?,
             ca_file: required_env("GATEWAY_CA_FILE")?,
             ca_pem: String::new(),
@@ -92,6 +95,7 @@ impl GatewaySettings {
             retry_delay_ms: env_or("GATEWAY_RETRY_DELAY_MS", 500)?,
             control_port: required_env("GATEWAY_CONTROL_PORT")?,
             control_timeout_ms: env_or("GATEWAY_CONTROL_TIMEOUT_MS", 5_000)?,
+            http_service_port: env_or("GATEWAY_HTTP_SERVICE_PORT", 8_508)?,
             recovery_attempts: Arc::new(AtomicU32::new(3)),
             transport_policy: Arc::new(AtomicU8::new(0b0000_0111)),
             gateway_up_return_sec: env_or("GATEWAY_UP_RETURN_SEC", 30)?,
@@ -108,6 +112,15 @@ impl GatewaySettings {
             !self.host.trim().is_empty(),
             "GATEWAY_HOST must not be empty"
         );
+        let control_ip: Ipv4Addr = self
+            .control_host
+            .trim()
+            .parse()
+            .context("GATEWAY_CONTROL_HOST must be an IPv4 address")?;
+        ensure!(
+            control_ip.is_private() || control_ip.is_loopback(),
+            "GATEWAY_CONTROL_HOST must be a private or loopback IPv4 address"
+        );
         ensure!(
             !self.server_name.trim().is_empty(),
             "GATEWAY_TLS_SERVER_NAME must not be empty"
@@ -120,6 +133,10 @@ impl GatewaySettings {
         ensure!(
             self.control_port != 0,
             "GATEWAY_CONTROL_PORT must be nonzero"
+        );
+        ensure!(
+            self.http_service_port != 0,
+            "GATEWAY_HTTP_SERVICE_PORT must be nonzero"
         );
         ensure!(
             self.connect_timeout_ms != 0 && self.control_timeout_ms != 0,
@@ -1136,6 +1153,7 @@ mod fallback_tests {
     fn gateway_settings() -> GatewaySettings {
         GatewaySettings {
             host: "gateway".into(),
+            control_host: "192.168.1.132".into(),
             port: 18080,
             server_name: "gateway".into(),
             ca_file: String::new(),
@@ -1144,6 +1162,7 @@ mod fallback_tests {
             retry_delay_ms: 0,
             control_port: 18500,
             control_timeout_ms: 100,
+            http_service_port: 8508,
             recovery_attempts: Arc::new(AtomicU32::new(3)),
             transport_policy: Arc::new(AtomicU8::new(0b0000_0111)),
             gateway_up_return_sec: 30,

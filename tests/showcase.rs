@@ -114,6 +114,7 @@ async fn gateway_connection_falls_back_to_tcp_after_quic_and_tls_fail() -> anyho
         .port();
     let settings = GatewaySettings {
         host: "127.0.0.1".into(),
+        control_host: "127.0.0.1".into(),
         port: tcp_port,
         server_name: "localhost".into(),
         ca_file: String::new(),
@@ -122,6 +123,7 @@ async fn gateway_connection_falls_back_to_tcp_after_quic_and_tls_fail() -> anyho
         retry_delay_ms: 0,
         control_port: 1,
         control_timeout_ms: 100,
+        http_service_port: 8508,
         recovery_attempts: Arc::new(AtomicU32::new(3)),
         transport_policy: Arc::new(AtomicU8::new(0b0000_0111)),
         gateway_up_return_sec: 30,
@@ -166,6 +168,7 @@ async fn gateway_connection_falls_back_to_verified_tls_after_quic_fails() -> any
         .port();
     let settings = GatewaySettings {
         host: "127.0.0.1".into(),
+        control_host: "127.0.0.1".into(),
         port: tls_port,
         server_name: "localhost".into(),
         ca_file: String::new(),
@@ -174,6 +177,7 @@ async fn gateway_connection_falls_back_to_verified_tls_after_quic_fails() -> any
         retry_delay_ms: 0,
         control_port: 1,
         control_timeout_ms: 100,
+        http_service_port: 8508,
         recovery_attempts: Arc::new(AtomicU32::new(3)),
         transport_policy: Arc::new(AtomicU8::new(0b0000_0111)),
         gateway_up_return_sec: 30,

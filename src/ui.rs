@@ -143,6 +143,7 @@ fn clip(mut text: String) -> String {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Request,
+    Http,
     Batch,
     Policy,
     Metrics,
@@ -160,12 +161,14 @@ struct LogEntry {
 struct SettingsDraft {
     host: String,
     port: String,
+    control_host: String,
     server_name: String,
     ca_file: String,
     connect_timeout_ms: String,
     retry_delay_ms: String,
     control_port: String,
     control_timeout_ms: String,
+    http_service_port: String,
     ping_ms: String,
     missed_pongs: String,
     recovery_attempts: String,
@@ -238,12 +241,14 @@ impl SettingsDraft {
         Ok(Self {
             host: value("GATEWAY_HOST", ""),
             port: value("GATEWAY_PORT", ""),
+            control_host: value("GATEWAY_CONTROL_HOST", "192.168.1.132"),
             server_name: value("GATEWAY_TLS_SERVER_NAME", ""),
             ca_file: value("GATEWAY_CA_FILE", ""),
             connect_timeout_ms: value("GATEWAY_CONNECT_TIMEOUT_MS", "10000"),
             retry_delay_ms: value("GATEWAY_RETRY_DELAY_MS", "500"),
             control_port: value("GATEWAY_CONTROL_PORT", ""),
             control_timeout_ms: value("GATEWAY_CONTROL_TIMEOUT_MS", "5000"),
+            http_service_port: value("GATEWAY_HTTP_SERVICE_PORT", "8508"),
             ping_ms: value("GATEWAY_PING_INTERVAL_MS", "10000"),
             missed_pongs: value("GATEWAY_MISSED_PONGS", "3"),
             recovery_attempts: value("GATEWAY_RECOVERY_ATTEMPTS", "3"),
@@ -255,12 +260,14 @@ impl SettingsDraft {
         Self {
             host: settings.host.clone(),
             port: settings.port.to_string(),
+            control_host: settings.control_host.clone(),
             server_name: settings.server_name.clone(),
             ca_file: settings.ca_file.clone(),
             connect_timeout_ms: settings.connect_timeout_ms.to_string(),
             retry_delay_ms: settings.retry_delay_ms.to_string(),
             control_port: settings.control_port.to_string(),
             control_timeout_ms: settings.control_timeout_ms.to_string(),
+            http_service_port: settings.http_service_port.to_string(),
             ping_ms: policy.ping_ms.to_string(),
             missed_pongs: policy.missed_pongs.to_string(),
             recovery_attempts: policy.recovery_attempts.to_string(),
@@ -271,6 +278,7 @@ impl SettingsDraft {
     fn build(&self) -> Result<(GatewaySettings, RuntimeSettings)> {
         for (key, value) in [
             ("GATEWAY_HOST", self.host.as_str()),
+            ("GATEWAY_CONTROL_HOST", self.control_host.as_str()),
             ("GATEWAY_TLS_SERVER_NAME", self.server_name.as_str()),
             ("GATEWAY_CA_FILE", self.ca_file.as_str()),
         ] {
@@ -292,6 +300,7 @@ impl SettingsDraft {
         let settings = GatewaySettings {
             host: self.host.trim().to_owned(),
             port: parse_setting(&self.port, "GATEWAY_PORT")?,
+            control_host: self.control_host.trim().to_owned(),
             server_name: self.server_name.trim().to_owned(),
             ca_file,
             ca_pem,
@@ -305,6 +314,7 @@ impl SettingsDraft {
                 &self.control_timeout_ms,
                 "GATEWAY_CONTROL_TIMEOUT_MS",
             )?,
+            http_service_port: parse_setting(&self.http_service_port, "GATEWAY_HTTP_SERVICE_PORT")?,
             recovery_attempts: Arc::new(AtomicU32::new(policy.recovery_attempts)),
             transport_policy: Arc::new(std::sync::atomic::AtomicU8::new(0b0000_0111)),
             gateway_up_return_sec: parse_setting(
@@ -318,15 +328,17 @@ impl SettingsDraft {
 
     fn to_env(&self) -> String {
         format!(
-            "GATEWAY_HOST={}\nGATEWAY_PORT={}\nGATEWAY_TLS_SERVER_NAME={}\nGATEWAY_CA_FILE={}\nGATEWAY_CONNECT_TIMEOUT_MS={}\nGATEWAY_RETRY_DELAY_MS={}\nGATEWAY_CONTROL_PORT={}\nGATEWAY_CONTROL_TIMEOUT_MS={}\nGATEWAY_PING_INTERVAL_MS={}\nGATEWAY_MISSED_PONGS={}\nGATEWAY_RECOVERY_ATTEMPTS={}\nGATEWAY_UP_RETURN_SEC={}\n",
+            "GATEWAY_HOST={}\nGATEWAY_PORT={}\nGATEWAY_CONTROL_HOST={}\nGATEWAY_TLS_SERVER_NAME={}\nGATEWAY_CA_FILE={}\nGATEWAY_CONNECT_TIMEOUT_MS={}\nGATEWAY_RETRY_DELAY_MS={}\nGATEWAY_CONTROL_PORT={}\nGATEWAY_CONTROL_TIMEOUT_MS={}\nGATEWAY_HTTP_SERVICE_PORT={}\nGATEWAY_PING_INTERVAL_MS={}\nGATEWAY_MISSED_PONGS={}\nGATEWAY_RECOVERY_ATTEMPTS={}\nGATEWAY_UP_RETURN_SEC={}\n",
             self.host.trim(),
             self.port.trim(),
+            self.control_host.trim(),
             self.server_name.trim(),
             self.ca_file.trim(),
             self.connect_timeout_ms.trim(),
             self.retry_delay_ms.trim(),
             self.control_port.trim(),
             self.control_timeout_ms.trim(),
+            self.http_service_port.trim(),
             self.ping_ms.trim(),
             self.missed_pongs.trim(),
             self.recovery_attempts.trim(),
@@ -387,6 +399,9 @@ pub struct DesktopApp {
     status: String,
     log_filter: String,
     only_errors: bool,
+    http_method: String,
+    http_endpoint: String,
+    http_body: String,
 }
 
 impl DesktopApp {
@@ -424,14 +439,16 @@ impl DesktopApp {
         let map = connection.as_ref().map_or_else(
             crate::ecosystem_map::EcosystemMap::default,
             |connection| {
-                crate::ecosystem_map::EcosystemMap::configured_with_transport(
-                    connection.host.clone(),
+                let mut map = crate::ecosystem_map::EcosystemMap::configured_with_transport(
+                    connection.control_host.clone(),
                     connection.control_port,
                     connection.control_timeout_ms,
                     ecosystem::CONTROL_PLANE_TRANSPORT,
                     connection.server_name.clone(),
                     connection.ca_pem.clone(),
-                )
+                );
+                map.set_http_service_port(connection.http_service_port);
+                map
             },
         );
         let mut app = Self {
@@ -465,6 +482,9 @@ impl DesktopApp {
             backend_host_draft: String::new(),
             backend_ports_draft: r#"{"tcp":18081}"#.into(),
             backend_pool_size_draft: "4".into(),
+            http_method: "GET".into(),
+            http_endpoint: "/".into(),
+            http_body: String::new(),
             settings_open: false,
             settings_draft: None,
             settings_error: None,
@@ -891,7 +911,7 @@ impl DesktopApp {
             self.methods_error = Some("Gateway configuration is unavailable".into());
             return;
         };
-        let host = connection.host.clone();
+        let host = connection.control_host.clone();
         let port = connection.control_port;
         let timeout = Duration::from_millis(connection.control_timeout_ms);
         let transport = ecosystem::CONTROL_PLANE_TRANSPORT.to_owned();
@@ -922,7 +942,7 @@ impl DesktopApp {
         let Some(connection) = &self.connection else {
             return;
         };
-        let host = connection.host.clone();
+        let host = connection.control_host.clone();
         let port = connection.control_port;
         let timeout = Duration::from_millis(connection.control_timeout_ms);
         let transport = ecosystem::CONTROL_PLANE_TRANSPORT.to_owned();
@@ -956,7 +976,7 @@ impl DesktopApp {
             self.backends_error = Some("Gateway configuration is unavailable".into());
             return;
         };
-        let host = connection.host.clone();
+        let host = connection.control_host.clone();
         let port = connection.control_port;
         let timeout = Duration::from_millis(connection.control_timeout_ms);
         let transport = ecosystem::CONTROL_PLANE_TRANSPORT.to_owned();
@@ -1023,7 +1043,7 @@ impl DesktopApp {
             self.backends_error = Some("Gateway configuration is unavailable".into());
             return;
         };
-        let host = connection.host.clone();
+        let host = connection.control_host.clone();
         let port = connection.control_port;
         let timeout = Duration::from_millis(connection.control_timeout_ms);
         let transport = ecosystem::CONTROL_PLANE_TRANSPORT.to_owned();
@@ -1050,7 +1070,7 @@ impl DesktopApp {
             self.backends_error = Some("Gateway configuration is unavailable".into());
             return;
         };
-        let host = connection.host.clone();
+        let host = connection.control_host.clone();
         let port = connection.control_port;
         let timeout = Duration::from_millis(connection.control_timeout_ms);
         let transport = ecosystem::CONTROL_PLANE_TRANSPORT.to_owned();
@@ -1120,7 +1140,7 @@ impl DesktopApp {
         let Some(connection) = &self.connection else {
             return;
         };
-        let host = connection.host.clone();
+        let host = connection.control_host.clone();
         let port = connection.control_port;
         let timeout = Duration::from_millis(connection.control_timeout_ms);
         let connection_transport = ecosystem::CONTROL_PLANE_TRANSPORT.to_owned();
@@ -1189,13 +1209,14 @@ impl DesktopApp {
             self.connection = Some(settings.clone());
             self.policy = policy;
             self.map = crate::ecosystem_map::EcosystemMap::configured_with_transport(
-                settings.host.clone(),
+                settings.control_host.clone(),
                 settings.control_port,
                 settings.control_timeout_ms,
                 ecosystem::CONTROL_PLANE_TRANSPORT,
                 settings.server_name.clone(),
                 settings.ca_pem.clone(),
             );
+            self.map.set_http_service_port(settings.http_service_port);
             Ok(())
         })();
         match result {
@@ -1388,6 +1409,10 @@ impl DesktopApp {
         }
         if let Some(connection) = &self.connection {
             ui.label(format!("Gateway: {}", connection.host));
+            ui.label(format!(
+                "Control Plane: {}:{}",
+                connection.control_host, connection.control_port
+            ));
             ui.label("QUIC → TLS → TCP (3 attempts each)");
             if !connection.ca_file.is_empty() {
                 ui.label(format!("CA file: {}", connection.ca_file));
@@ -1525,6 +1550,58 @@ impl DesktopApp {
             });
         });
         ui.small("Timeout: configure Policy. Cancellation drops the local future; it cannot undo server-side effects.");
+    }
+
+    fn http_service_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("HTTP service request");
+        let service = self
+            .connection
+            .as_ref()
+            .map(|settings| (settings.control_host.clone(), settings.http_service_port));
+        if let Some((host, port)) = &service {
+            ui.label(format!("Service base: http://{host}:{port}"));
+        } else {
+            ui.colored_label(
+                Color32::LIGHT_RED,
+                "Configure the private service address in .env or Settings.",
+            );
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Method");
+            egui::ComboBox::from_id_salt("http-service-method")
+                .selected_text(&self.http_method)
+                .show_ui(ui, |ui| {
+                    for method in ["GET", "POST", "PUT", "DELETE"] {
+                        ui.selectable_value(&mut self.http_method, method.to_owned(), method);
+                    }
+                });
+        });
+        ui.label("Endpoint path");
+        ui.add(TextEdit::singleline(&mut self.http_endpoint).hint_text("/api/resource"));
+        ui.label("JSON body (optional)");
+        ui.add(
+            TextEdit::multiline(&mut self.http_body)
+                .code_editor()
+                .desired_rows(8)
+                .desired_width(f32::INFINITY),
+        );
+        if ui
+            .add_enabled(service.is_some(), egui::Button::new("Send HTTP request"))
+            .clicked()
+        {
+            let (host, port) = service.expect("button enabled with a configured HTTP service");
+            let method = self.http_method.clone();
+            let endpoint = self.http_endpoint.clone();
+            let body = self.http_body.clone();
+            self.run(&format!("{method} {endpoint}"), async move {
+                json_rpc_2_tester::http_service::send_request(
+                    &host, port, &method, &endpoint, &body,
+                )
+                .await
+            });
+        }
+        ui.small("Requests are sent only to the configured private IPv4 service; redirects are disabled.");
     }
 
     fn batch_tab(&mut self, ui: &mut egui::Ui) {
@@ -1987,6 +2064,7 @@ impl eframe::App for DesktopApp {
             ui.horizontal_wrapped(|ui| {
                 for (tab, label) in [
                     (Tab::Request, "Request"),
+                    (Tab::Http, "HTTP service"),
                     (Tab::Batch, "Batch"),
                     (Tab::Policy, "Policy & liveness"),
                     (Tab::Metrics, "Metrics"),
@@ -2002,6 +2080,7 @@ impl eframe::App for DesktopApp {
                 .show(ui, |ui| {
                     match self.tab {
                         Tab::Request => self.request_tab(ui),
+                        Tab::Http => self.http_service_tab(ui),
                         Tab::Batch => self.batch_tab(ui),
                         Tab::Policy => self.policy_tab(ui),
                         Tab::Metrics => self.metrics_tab(ui),
@@ -2081,6 +2160,9 @@ impl eframe::App for DesktopApp {
                             ui.label("Gateway port");
                             ui.text_edit_singleline(&mut draft.port);
                             ui.end_row();
+                            ui.label("Control Plane LAN IPv4");
+                            ui.text_edit_singleline(&mut draft.control_host);
+                            ui.end_row();
                             ui.label("TLS server name");
                             ui.text_edit_singleline(&mut draft.server_name);
                             ui.end_row();
@@ -2098,6 +2180,9 @@ impl eframe::App for DesktopApp {
                             ui.end_row();
                             ui.label("Control Plane timeout (ms)");
                             ui.text_edit_singleline(&mut draft.control_timeout_ms);
+                            ui.end_row();
+                            ui.label("HTTP service port");
+                            ui.text_edit_singleline(&mut draft.http_service_port);
                             ui.end_row();
                             ui.label("Ping interval (ms)");
                             ui.text_edit_singleline(&mut draft.ping_ms);
