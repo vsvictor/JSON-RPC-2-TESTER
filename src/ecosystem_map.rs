@@ -323,6 +323,20 @@ struct Card {
     lines: Vec<(String, Color32)>,
 }
 
+fn gateway_traffic_lines(
+    gateway: &json_rpc_2_tester::ecosystem::Gateway,
+    color: Color32,
+) -> Vec<(String, Color32)> {
+    let format_traffic = |label: &str, bytes: Option<u64>| {
+        let value = bytes.map_or_else(|| "недоступно".to_owned(), |bytes| format!("{bytes} B"));
+        (format!("{label}: {value}"), color)
+    };
+    vec![
+        format_traffic("Вхідний трафік", gateway.inbound_traffic_bytes),
+        format_traffic("Вихідний трафік", gateway.outbound_traffic_bytes),
+    ]
+}
+
 fn draw_inventory(
     ui: &mut egui::Ui,
     inventory: &Components,
@@ -340,8 +354,9 @@ fn draw_inventory(
         (format!("uptime: {} s", gateway.uptime_seconds), text_color),
         (format!("Control: {}", gateway.control_address), text_color),
         (format!("Metrics: {}", gateway.metrics_address), text_color),
-        ("Ingress listeners:".into(), CLOSED),
     ];
+    gateway_lines.extend(gateway_traffic_lines(gateway, text_color));
+    gateway_lines.push(("Ingress listeners:".into(), CLOSED));
     gateway_lines.extend(gateway_ingress_lines(gateway, text_color));
     let gateway_card = Card {
         title: "Gateway".into(),
@@ -585,6 +600,8 @@ mod tests {
             version: "1".into(),
             pid: 1,
             uptime_seconds: 1,
+            inbound_traffic_bytes: None,
+            outbound_traffic_bytes: None,
             listeners: vec![
                 json_rpc_2_tester::ecosystem::Listener {
                     transport: "tcp".into(),
@@ -681,3 +698,7 @@ mod tests {
         runtime.block_on(server).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "ecosystem_map/traffic/tests.rs"]
+mod traffic_tests;

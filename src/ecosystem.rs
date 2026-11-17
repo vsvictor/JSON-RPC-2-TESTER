@@ -145,6 +145,8 @@ pub struct Gateway {
     pub version: String,
     pub pid: u32,
     pub uptime_seconds: u64,
+    pub inbound_traffic_bytes: Option<u64>,
+    pub outbound_traffic_bytes: Option<u64>,
     pub listeners: Vec<Listener>,
     pub control_address: String,
     pub metrics_address: String,

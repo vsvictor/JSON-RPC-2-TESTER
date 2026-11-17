@@ -53,7 +53,7 @@ Build Tools. Інтеграційні перевірки в цьому сере�
 | --- | --- |
 | Gateway connection | Автоматичне підключення зі значень `.env`; QUIC → TLS → TCP, по три спроби на транспорт; спільна RPC-сесія для всіх вкладок |
 | Request | `list_methods` із Control Plane; вибір лише оголошених backend-методів і підстановка кожного зразка `method_details.example_request.params`, перегляд `params_schema`, структуровані object/array params, відсутні params, `notify`, типізоване `request<P, R>` із serde та `request_without_params<R>` |
-| HTTP service | GET/POST/PUT/DELETE до `http://GATEWAY_CONTROL_HOST:GATEWAY_HTTP_SERVICE_PORT`, відносний endpoint, необов'язкове JSON тіло, перегляд статусу/заголовків/тіла відповіді |
+| HTTP service | GET/POST/PUT/DELETE до `http://GATEWAY_CONTROL_HOST:GATEWAY_HTTP_SERVICE_PORT`, типово `POST /send-to-user`, необов'язкове JSON тіло, перегляд статусу/заголовків/тіла відповіді |
 | Batch | Змішані виклики/сповіщення, автоматичні ID, кореляція результатів у порядку вхідних викликів, окремі remote errors; notification-only batch |
 | Parallel calls | Клонування клієнта зі спільною сесією та ID; 1–64 конкурентних запити, окремий результат/помилка кожного |
 | Policy & liveness | Автоматичний ping за `GATEWAY_PING_INTERVAL_MS`; поріг missed pong і кількість повторів restore задаються в `.env` та змінюються в Runtime policy; після вичерпання restore виконується Gateway fallback reconnect |
@@ -63,6 +63,43 @@ Build Tools. Інтеграційні перевірки в цьому сере�
 | Metrics | Справжній `ClientMetricsSnapshot`: активні запити, черга, RPC calls/errors, timeouts, cancellations, recovery attempts, missed pongs; застосована конфігурація |
 | Event log | Події `tracing` бібліотеки, liveness/recovery, фільтр, рівні, копіювання; опційний DEBUG/TRACE |
 | Мапа | Граф Gateway → in-process Balancer → backend-и; ingress endpoints, circuit breakers та зайнятість connection pools через Control Plane |
+| Тестування → Навантаження → З'єднання | Окремі одночасні з'єднання з налаштованим кроком, транспортний ping та результати у реальному часі |
+
+### Навантажувальне тестування з'єднань / Connection load testing
+
+Виберіть **Тестування → Навантаження → З'єднання**, задайте кількість з'єднань
+на крок, інтервал кроку та інтервал ping у секундах і натисніть **Запустити**.
+Типово це 1000 з'єднань кожні 5 секунд і ping кожні 4 секунди. Значення мають
+бути додатними й змінюються лише перед запуском або після зупинки. Перший крок
+і перший ping виконуються одразу. Необхідна основна сесія; використовується її
+поточний транспорт (QUIC, TLS або TCP) без fallback і автоматичного перепідключення.
+Помилки підключення, ping і закриття, кількість активних з'єднань та інші
+показники відображаються під час роботи.
+Мітка «Клієнт» позначає локальні помилки та тайм-аути клієнта; тайм-аут не
+доводить, яка сторона спричинила затримку. Для транспортних помилок без
+достовірних даних показується «Сторона невідома», а не припущення про сервер.
+Невдале з'єднання закривається і не
+відновлюється. **Зупинити** скасовує підключення, що ще тривають, та закриває
+відкриті з'єднання; тест також зупиняється при закритті застосунку. Перехід
+на іншу вкладку не зупиняє тест. Кількість з'єднань не обмежена: запускайте
+лише на сервері, для якого дозволено навантажувальне тестування, і стежте за
+ресурсами клієнта та сервера.
+
+Select **Тестування → Навантаження → З'єднання**, configure connections per step,
+step interval, and ping interval in seconds, then press **Запустити**. Defaults
+are 1000 connections every 5 seconds and a ping every 4 seconds. Values must be
+positive and can only be changed before starting or after stopping. The first step
+and first ping occur immediately. The main session must be connected; the test uses
+its current QUIC, TLS, or TCP transport, without fallback or automatic reconnection.
+Live results include active connections, connection, ping and close failures.
+The “Клієнт” label identifies local errors and client-side deadlines; a timeout
+does not establish which side caused the delay. Transport errors without reliable
+origin information are labelled “Сторона невідома” (unknown side), not attributed
+to the server.
+Failed connections are closed without retry. **Зупинити** cancels pending
+connections and closes established ones; closing the application also stops the
+test. Switching tabs does not stop it. There is no connection limit: test only
+servers you are authorized to load and monitor both client and server resources.
 
 ### Мапа екосистеми Gateway
 
@@ -79,8 +116,9 @@ All Control Plane requests (method catalog, transport status, backends, and map)
 use the separate private `GATEWAY_CONTROL_HOST` address instead of `GATEWAY_HOST`.
 The default is `192.168.1.132`, and it can also be changed in UI Settings.
 The new HTTP service is mapped at `http://GATEWAY_CONTROL_HOST:GATEWAY_HTTP_SERVICE_PORT`;
-the port defaults to `8508`. The HTTP service tab supports GET, POST, PUT, and
-DELETE with a relative endpoint and an optional JSON body.
+the port defaults to `8508`. The HTTP service tab defaults to `POST /send-to-user`
+and supports GET, POST, PUT, and DELETE with a relative endpoint and an optional
+JSON body.
 
 The method catalog accepts missing or `null` request examples, leaving those
 methods available for manual parameter entry. Malformed examples or schema
@@ -99,6 +137,16 @@ Structural catalog errors, including duplicate method names, remain errors.
 їхні host/transport/port, pool size та idle/empty/busy slots. Circuit states
 позначені кольорами: `closed` — бірюзовий, `open` — червоний, `half_open` —
 жовтий; також показані failures, retry delay або probe-in-flight відповідно.
+Плашка Gateway також показує накопичений вхідний і вихідний трафік JSON-RPC
+у байтах від запуску шлюзу. Це розмір payload, без транспортного обрамлення,
+шифрування та мережевих заголовків. Старі версії шлюзу, що не повертають ці
+лічильники у `list_components`, відображаються як «недоступно».
+
+The Gateway card also displays cumulative inbound and outbound JSON-RPC payload
+bytes since the gateway started, excluding transport framing, encryption and
+network headers. Older gateways that do not return these counters in
+`list_components` are shown as unavailable.
+
 Масштаб і прокрутка дозволяють переглянути великий граф; наведення на вузол
 показує повний текст адрес та станів. Оновлення автоматичне, також під час
 перегляду інших вкладок. TCP-з'єднання Control Plane повторно використовує

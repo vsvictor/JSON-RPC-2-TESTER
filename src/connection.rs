@@ -648,6 +648,57 @@ pub async fn connect_gateway(
     Ok((client, transport))
 }
 
+#[derive(Debug)]
+pub enum LoadConnectError {
+    Client(anyhow::Error),
+    Timeout { timeout_ms: u64 },
+    Transport(anyhow::Error),
+}
+
+impl std::fmt::Display for LoadConnectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client(error) | Self::Transport(error) => write!(formatter, "{error:#}"),
+            Self::Timeout { timeout_ms } => {
+                write!(
+                    formatter,
+                    "перевищено тайм-аут підключення ({timeout_ms} мс)"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for LoadConnectError {}
+
+pub async fn connect_gateway_test_transport(
+    settings: &GatewaySettings,
+    kind: &str,
+) -> std::result::Result<Transport, LoadConnectError> {
+    settings.validate().map_err(LoadConnectError::Client)?;
+    let kind = match kind {
+        "tcp" => "tcp",
+        "tls" => "tls",
+        "quic" => "quic",
+        _ => {
+            return Err(LoadConnectError::Client(anyhow::anyhow!(
+                "Unsupported gateway load-test transport: {kind}"
+            )));
+        }
+    };
+    let connection = settings.connection(kind, settings.port);
+    connection.validate().map_err(LoadConnectError::Client)?;
+    tokio::time::timeout(
+        Duration::from_millis(connection.connect_timeout_ms),
+        create_transport(&connection),
+    )
+    .await
+    .map_err(|_| LoadConnectError::Timeout {
+        timeout_ms: connection.connect_timeout_ms,
+    })?
+    .map_err(LoadConnectError::Transport)
+}
+
 async fn client_for_transport(transport: Transport, config: RpcClientConfig) -> Result<Client> {
     let client = Client::new_with_config(transport, config.clone())?;
     // Construction stores liveness policy; set_config starts the periodic task.

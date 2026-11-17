@@ -149,6 +149,7 @@ enum Tab {
     Metrics,
     Log,
     Map,
+    ConnectionLoad,
 }
 
 struct LogEntry {
@@ -349,6 +350,7 @@ impl SettingsDraft {
 
 pub struct DesktopApp {
     map: crate::ecosystem_map::EcosystemMap,
+    connection_load: crate::connection_load_bloc::ConnectionLoadBloc,
     runtime: Option<Runtime>,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
@@ -453,6 +455,7 @@ impl DesktopApp {
         );
         let mut app = Self {
             map,
+            connection_load: Default::default(),
             runtime: Some(runtime),
             tx,
             rx,
@@ -482,8 +485,8 @@ impl DesktopApp {
             backend_host_draft: String::new(),
             backend_ports_draft: r#"{"tcp":18081}"#.into(),
             backend_pool_size_draft: "4".into(),
-            http_method: "GET".into(),
-            http_endpoint: "/".into(),
+            http_method: "POST".into(),
+            http_endpoint: "/send-to-user".into(),
             http_body: String::new(),
             settings_open: false,
             settings_draft: None,
@@ -527,6 +530,27 @@ impl DesktopApp {
         self.runtime
             .as_ref()
             .expect("runtime exists until app shutdown")
+    }
+
+    fn start_connection_load(&mut self) {
+        let Some(settings) = self.connection.clone() else {
+            self.error("Клієнт / тест з'єднань: налаштування шлюзу недоступні");
+            return;
+        };
+        let Some((_, transport)) = &self.client else {
+            self.error("Клієнт / тест з'єднань: спочатку підключіться до шлюзу");
+            return;
+        };
+        let kind = transport.kind();
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("runtime exists until shutdown");
+        if let Err(error) = self.connection_load.start(runtime, settings, kind) {
+            self.error(format!(
+                "Клієнт / не вдалося запустити тест з'єднань: {error:#}"
+            ));
+        }
     }
 
     fn log(&mut self, level: Level, message: impl Into<String>) {
@@ -1578,7 +1602,7 @@ impl DesktopApp {
                 });
         });
         ui.label("Endpoint path");
-        ui.add(TextEdit::singleline(&mut self.http_endpoint).hint_text("/api/resource"));
+        ui.add(TextEdit::singleline(&mut self.http_endpoint).hint_text("/send-to-user"));
         ui.label("JSON body (optional)");
         ui.add(
             TextEdit::multiline(&mut self.http_body)
@@ -1968,6 +1992,11 @@ impl DesktopApp {
 impl eframe::App for DesktopApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.drain();
+        self.connection_load.poll(
+            self.runtime
+                .as_ref()
+                .expect("runtime exists until shutdown"),
+        );
         let transport_interval = self
             .connection
             .as_ref()
@@ -2003,6 +2032,7 @@ impl eframe::App for DesktopApp {
         ctx.request_repaint_after(Duration::from_millis(150));
         let mut open_settings = false;
         let mut open_backends = false;
+        let mut open_connection_load = false;
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(RichText::new("JSON-RPC-2").color(ACCENT));
@@ -2033,6 +2063,14 @@ impl eframe::App for DesktopApp {
                             ui.close();
                         }
                     });
+                    ui.menu_button("Тестування", |ui| {
+                        ui.menu_button("Навантаження", |ui| {
+                            if ui.button("З'єднання").clicked() {
+                                open_connection_load = true;
+                                ui.close();
+                            }
+                        });
+                    });
                 });
             });
         });
@@ -2042,6 +2080,9 @@ impl eframe::App for DesktopApp {
         if open_backends {
             self.backends_open = true;
             self.start_backends_discovery();
+        }
+        if open_connection_load {
+            self.tab = Tab::ConnectionLoad;
         }
         self.show_backends_window(ctx);
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -2070,6 +2111,7 @@ impl eframe::App for DesktopApp {
                     (Tab::Metrics, "Metrics"),
                     (Tab::Log, "Event log"),
                     (Tab::Map, "Мапа"),
+                    (Tab::ConnectionLoad, "Навантаження: з'єднання"),
                 ] {
                     ui.selectable_value(&mut self.tab, tab, label);
                 }
@@ -2086,6 +2128,11 @@ impl eframe::App for DesktopApp {
                         Tab::Metrics => self.metrics_tab(ui),
                         Tab::Log => self.log_tab(ui),
                         Tab::Map => self.map.show(ui),
+                        Tab::ConnectionLoad => {
+                            if crate::connection_load_screen::show(ui, &mut self.connection_load) {
+                                self.start_connection_load();
+                            }
+                        }
                     }
                     if !self.tasks.is_empty() {
                         ui.separator();
@@ -2233,6 +2280,7 @@ impl Drop for DesktopApp {
         }
         if let Some(runtime) = self.runtime.take() {
             runtime.block_on(async {
+                self.connection_load.shutdown().await;
                 if let Some((client, _)) = self.client.take() {
                     match tokio::time::timeout(Duration::from_secs(3), client.close()).await {
                         Ok(Ok(())) => {}

@@ -1,3 +1,5 @@
+mod connection_load_bloc;
+mod connection_load_screen;
 mod ecosystem_map;
 mod ui;
 
